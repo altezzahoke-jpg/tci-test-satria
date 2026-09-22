@@ -21,10 +21,15 @@
 #include "esp_rom_sys.h"
 #include "soc/gpio_struct.h"
 #include "soc/gpio_reg.h"
+#include "esp_idf_version.h"
 
-// Penyesuaian makro ADC untuk kompatibilitas ESP-IDF v5.0+
-#ifndef ADC_ATTEN_DB_11
-#define ADC_ATTEN_DB_11 ADC_ATTEN_DB_12
+// -----------------------------------------------------------------------------
+// PENYESUAIAN KOMPATIBILITAS ATENUASI ADC UNTUK ESP-IDF V5.1 DAN V5.2+
+// -----------------------------------------------------------------------------
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
+#define ADC_ATTEN_TARGET ADC_ATTEN_DB_12
+#else
+#define ADC_ATTEN_TARGET ADC_ATTEN_DB_11
 #endif
 
 // -----------------------------------------------------------------------------
@@ -50,7 +55,7 @@
 #define AP_SSID "TCI_SatriaFU_Pro"
 #define AP_PASS "12345678"
 
-static const char *TAG = "TCI_IDF_PRO";
+static const char *TAG __attribute__((unused)) = "TCI_IDF_PRO";
 
 portMUX_TYPE isrMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -88,7 +93,7 @@ typedef struct {
 #pragma pack(pop)
 
 // -----------------------------------------------------------------------------
-// HARDWARE TIMERS, ADC CALIBRATION & VARIABEL
+// HARDWARE TIMERS, ADC CALIBRATION & VARIABEL GLOBAL
 // -----------------------------------------------------------------------------
 gptimer_handle_t timerDelay = NULL;
 gptimer_handle_t timerDwell = NULL;
@@ -369,6 +374,10 @@ void codeTaskIgnition(void * parameter) {
     if (interval_delta < -max_delta) interval_delta = -max_delta;
 
     uint32_t predicted_interval = (prev_interval > 0) ? ((local_interval * 2 + prev_interval) / 3 + interval_delta) : local_interval;
+    
+    // Proteksi Pembagian dengan Nol (Divide-by-Zero Crash Protection)
+    if (predicted_interval == 0) continue;
+
     prev_interval = local_interval;
     uint16_t rpm = (uint16_t)(60000000UL / predicted_interval);
     
@@ -423,13 +432,11 @@ void codeTaskIgnition(void * parameter) {
     uint32_t finalChargeDelayUs;
     uint32_t finalDwellUs;
 
-    // Perbaikan Logika Dwell Overlap (Sangat Krusial untuk RPM Tinggi)
+    // Logika Penanganan Dwell Overlap
     if (sparkDelayUs > targetDwellUs) {
       finalChargeDelayUs = sparkDelayUs - targetDwellUs;
       finalDwellUs = targetDwellUs;
     } else {
-      // Jika waktu eksekusi kurang dari target dwell, kita harus mengutamakan titik jatuh sudut spark
-      // agar mesin tidak backfire. Durasi Dwell terpaksa dipotong sementara.
       finalChargeDelayUs = 5; 
       finalDwellUs = (sparkDelayUs > 10) ? (sparkDelayUs - 5) : 5;
     }
@@ -487,7 +494,6 @@ void codeTaskSensor(void * parameter) {
     sensorFaultStatus = isFaulty; 
     portEXIT_CRITICAL(&isrMux);
     
-    // Perbaikan WDT Starvation: Delay ditingkatkan ke 10ms (100Hz)
     vTaskDelay(pdMS_TO_TICKS(10)); 
   }
 }
@@ -636,6 +642,14 @@ void codeTaskNetwork(void * parameter) {
 // SETUP UTAMA ESP-IDF (app_main)
 // -----------------------------------------------------------------------------
 void app_main(void) {
+  // 1. Inisialisasi Task Watchdog Timer (TWDT) PERTAMA SEBELUM PEMBUATAN TASK
+  esp_task_wdt_config_t twdt_config = { 
+    .timeout_ms = WDT_TIMEOUT_SECONDS * 1000, 
+    .idle_core_mask = (1 << 0) | (1 << 1), 
+    .trigger_panic = true 
+  };
+  esp_task_wdt_init(&twdt_config);
+
   // Config GPIO Output Initial Level
   gpio_config_t io_out = {
     .pin_bit_mask = (1ULL << PIN_TCI),
@@ -697,17 +711,21 @@ void app_main(void) {
   uart_set_pin(UART_NUM_2, PIN_TX_TELEMETRY, PIN_RX_TELEMETRY, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
   uart_driver_install(UART_NUM_2, 256, 0, 0, NULL, 0);
 
-  // Init ADC Oneshot + Curve Fitting Calibration
+  // Init ADC Oneshot + Curve Fitting Calibration (Diperbaiki untuk ESP-IDF v5.1)
   adc_oneshot_unit_init_cfg_t init_config1 = { .unit_id = ADC_UNIT_1 }; 
   adc_oneshot_new_unit(&init_config1, &adc1_handle);
-  adc_oneshot_chan_cfg_t config = { .bitwidth = ADC_BITWIDTH_12, .atten = ADC_ATTEN_DB_11 };
+  
+  adc_oneshot_chan_cfg_t config = { 
+    .bitwidth = ADC_BITWIDTH_12, 
+    .atten = ADC_ATTEN_TARGET 
+  };
   adc_oneshot_config_channel(adc1_handle, ADC_CHAN_TPS, &config); 
   adc_oneshot_config_channel(adc1_handle, ADC_CHAN_BATT, &config); 
   adc_oneshot_config_channel(adc1_handle, ADC_CHAN_TEMP, &config);
 
   adc_cali_curve_fitting_config_t cali_config = {
     .unit_id = ADC_UNIT_1,
-    .atten = ADC_ATTEN_DB_11,
+    .atten = ADC_ATTEN_TARGET,
     .bitwidth = ADC_BITWIDTH_12,
   };
   adc_cali_create_scheme_curve_fitting(&cali_config, &adc1_cali_handle);
@@ -753,16 +771,8 @@ void app_main(void) {
   esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
   
   loadCustomMap();
-  
-  // Task Watchdog Timer Initial Config
-  esp_task_wdt_config_t twdt_config = { 
-    .timeout_ms = WDT_TIMEOUT_SECONDS * 1000, 
-    .idle_core_mask = (1 << 0) | (1 << 1), 
-    .trigger_panic = true 
-  };
-  esp_task_wdt_init(&twdt_config);
 
-  // Task Creation
+  // Pembuatan Task Dilakukan Setelah Watchdog Siap
   xTaskCreatePinnedToCore(codeTaskNetwork, "TaskNet", 4096, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(codeTaskSensor, "TaskSens", 3072, NULL, 5, NULL, 0);
   xTaskCreatePinnedToCore(codeTaskIgnition, "TaskIgn", 4096, NULL, 24, &TaskIgnitionHandle, 1);
