@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -21,6 +22,11 @@
 #include "soc/gpio_struct.h"
 #include "soc/gpio_reg.h"
 
+// Penyesuaian makro ADC untuk kompatibilitas ESP-IDF v5.0+
+#ifndef ADC_ATTEN_DB_11
+#define ADC_ATTEN_DB_11 ADC_ATTEN_DB_12
+#endif
+
 // -----------------------------------------------------------------------------
 // KONFIGURASI HARDWARE & PIN ESP32-S3
 // -----------------------------------------------------------------------------
@@ -32,14 +38,13 @@
 #define PIN_RX_TELEMETRY GPIO_NUM_15
 #define PIN_TACH_OUT     GPIO_NUM_8
 
-// Register Akses Cepat GPIO (Direct Register Access untuk memotong overhead ISR)
+// Register Akses Cepat GPIO (Direct Register Access)
 #define TCI_HIGH()       REG_WRITE(GPIO_OUT_W1TS_REG, (1UL << PIN_TCI))
 #define TCI_LOW()        REG_WRITE(GPIO_OUT_W1TC_REG, (1UL << PIN_TCI))
 
-// Kanal ADC1 ESP32-S3
-#define ADC_CHAN_TPS     ADC_CHANNEL_0 // GPIO 1
-#define ADC_CHAN_BATT    ADC_CHANNEL_1 // GPIO 2
-#define ADC_CHAN_TEMP    ADC_CHANNEL_2 // GPIO 3
+#define ADC_CHAN_TPS     ADC_CHANNEL_0 
+#define ADC_CHAN_BATT    ADC_CHANNEL_1 
+#define ADC_CHAN_TEMP    ADC_CHANNEL_2 
 
 #define WDT_TIMEOUT_SECONDS 2
 #define AP_SSID "TCI_SatriaFU_Pro"
@@ -63,7 +68,7 @@ volatile EngineState currentEngineState = STATE_STOPPED;
 
 #pragma pack(push, 1)
 typedef struct {
-  uint16_t header;     // 0xAA55
+  uint16_t header;     
   uint16_t rpm;       
   uint8_t  tps;        
   int16_t  degree10;  
@@ -76,7 +81,7 @@ typedef struct {
 } TelemetryData;
 
 typedef struct {
-  uint16_t header;     // 0xCC55
+  uint16_t header;     
   uint8_t requestedMode;
   uint16_t crc16;      
 } CommandData;
@@ -93,12 +98,12 @@ adc_oneshot_unit_handle_t adc1_handle;
 adc_cali_handle_t adc1_cali_handle = NULL;
 httpd_handle_t server = NULL;
 
-const int16_t ROTOR_PULSER_DEGREES_10 = 350;
+const int16_t ROTOR_PULSER_DEGREES_10 = 350; // 35.0 Derajat BTDC
 const uint32_t BASE_DWELL_US          = 2500;
 const uint32_t MAX_SAFETY_DWELL_US    = 3500; 
 
 const uint16_t MAX_RPM_LIMIT    = 12000; 
-const int16_t  MAX_TEMP_LIMIT10 = 1100;  // 110,0 Celcius
+const int16_t  MAX_TEMP_LIMIT10 = 1100;  // 110.0 Celcius
 
 #define NUM_RPM_POINTS 15
 #define NUM_TPS_POINTS 5
@@ -122,7 +127,7 @@ volatile bool isTuningActive = false;
 volatile bool wirelessActive = false;
 
 // -----------------------------------------------------------------------------
-// MAP PENGAPIAN (DRAM_ATTR & DOUBLE-BUFFERING UNTUK LOCK-FREE READ)
+// MAP PENGAPIAN (DRAM_ATTR & DOUBLE-BUFFERING)
 // -----------------------------------------------------------------------------
 DRAM_ATTR const uint16_t rpmAxis[NUM_RPM_POINTS] = { 0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000, 12000, 13000, 14000 };
 DRAM_ATTR const uint8_t  tpsAxis[NUM_TPS_POINTS] = { 0, 25, 50, 75, 100 };
@@ -147,7 +152,6 @@ DRAM_ATTR const int16_t mapExtreme3DBase[NUM_RPM_POINTS][NUM_TPS_POINTS] = {
 
 DRAM_ATTR int16_t mapCustomSlots[MAX_CUSTOM_SLOTS][NUM_RPM_POINTS][NUM_TPS_POINTS];
 
-// Double-buffering untuk pembacaan Lock-Free tanpa Mutex Fallback
 DRAM_ATTR int16_t activeCustomMapBuffer[2][NUM_RPM_POINTS][NUM_TPS_POINTS];
 volatile uint8_t activeMapIndex = 0;
 
@@ -180,8 +184,6 @@ void updateActiveMapBuffer(void) {
   
   uint8_t nextBufferIndex = 1 - activeMapIndex;
   memcpy(activeCustomMapBuffer[nextBufferIndex], mapCustomSlots[slot], sizeof(activeCustomMapBuffer[0]));
-  
-  // Atomic Swap
   activeMapIndex = nextBufferIndex;
 }
 
@@ -221,18 +223,18 @@ static inline void IRAM_ATTR fast_start_gptimer(gptimer_handle_t timer, uint32_t
 }
 
 static bool IRAM_ATTR onSafetyDwellTimer(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx) {
-  TCI_LOW(); // Direct register reset
+  TCI_LOW(); 
   return false;
 }
 
 static bool IRAM_ATTR onDwellTimer(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx) {
-  TCI_LOW(); // Direct register reset (Spark Event)
+  TCI_LOW(); // Eksekusi Spark
   gptimer_stop(timerSafetyDwell);
   return false;
 }
 
 static bool IRAM_ATTR onDelayTimer(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx) {
-  TCI_HIGH(); // Direct register set (Charge Coil Start)
+  TCI_HIGH(); // Mulai Dwell (Charge Coil)
   
   portENTER_CRITICAL_ISR(&isrMux);
   uint32_t currentDwell = dwellUsGlobal;
@@ -281,7 +283,7 @@ static void IRAM_ATTR pulserISR(void* arg) {
 }
 
 // -----------------------------------------------------------------------------
-// PENGOLAHAN MAP PENGAPIAN (LOCK-FREE)
+// PENGOLAHAN MAP PENGAPIAN
 // -----------------------------------------------------------------------------
 int16_t get3DAdvanceDegreeFixed(uint16_t rpm, uint8_t tps, ModePengapian mode) {
   if (rpm < rpmAxis[0]) rpm = rpmAxis[0];
@@ -301,7 +303,6 @@ int16_t get3DAdvanceDegreeFixed(uint16_t rpm, uint8_t tps, ModePengapian mode) {
   } else if (mode == MODE_EXTREME) {
     q11 = mapExtreme3DBase[r0][t0]; q21 = mapExtreme3DBase[r1][t0]; q12 = mapExtreme3DBase[r0][t1]; q22 = mapExtreme3DBase[r1][t1];
   } else {
-    // Lock-free read via double buffer index
     uint8_t bufIdx = activeMapIndex;
     q11 = activeCustomMapBuffer[bufIdx][r0][t0]; 
     q21 = activeCustomMapBuffer[bufIdx][r1][t0]; 
@@ -330,7 +331,7 @@ int16_t get3DAdvanceDegreeFixed(uint16_t rpm, uint8_t tps, ModePengapian mode) {
 // TASKS
 // -----------------------------------------------------------------------------
 void codeTaskIgnition(void * parameter) {
-  esp_task_wdt_add(NULL); // Register task ke TWDT
+  esp_task_wdt_add(NULL); 
   uint32_t prev_interval = 0;
   
   for (;;) {
@@ -362,7 +363,6 @@ void codeTaskIgnition(void * parameter) {
 
     if (local_interval == 0) continue;
     
-    // Prediksi Akselerasi / Deselerasi Mesin
     int32_t interval_delta = (int32_t)local_interval - (int32_t)prev_interval;
     int32_t max_delta = (int32_t)(prev_interval * 20 / 100);  
     if (interval_delta > max_delta) interval_delta = max_delta;
@@ -419,12 +419,23 @@ void codeTaskIgnition(void * parameter) {
       TCI_LOW(); 
       continue;
     }
-    
-    int32_t chargeDelayUs = (int32_t)sparkDelayUs - (int32_t)targetDwellUs;
-    uint32_t finalChargeDelayUs = (chargeDelayUs >= 20) ? (uint32_t)chargeDelayUs : 20;
+
+    uint32_t finalChargeDelayUs;
+    uint32_t finalDwellUs;
+
+    // Perbaikan Logika Dwell Overlap (Sangat Krusial untuk RPM Tinggi)
+    if (sparkDelayUs > targetDwellUs) {
+      finalChargeDelayUs = sparkDelayUs - targetDwellUs;
+      finalDwellUs = targetDwellUs;
+    } else {
+      // Jika waktu eksekusi kurang dari target dwell, kita harus mengutamakan titik jatuh sudut spark
+      // agar mesin tidak backfire. Durasi Dwell terpaksa dipotong sementara.
+      finalChargeDelayUs = 5; 
+      finalDwellUs = (sparkDelayUs > 10) ? (sparkDelayUs - 5) : 5;
+    }
 
     portENTER_CRITICAL(&isrMux);
-    dwellUsGlobal = targetDwellUs; 
+    dwellUsGlobal = finalDwellUs; 
     calculatedChargeDelayUs = finalChargeDelayUs; 
     calculatedSparkCut = false;
     portEXIT_CRITICAL(&isrMux);
@@ -436,7 +447,7 @@ long mapRange(long x, long in_min, long in_max, long out_min, long out_max) {
 }
 
 void codeTaskSensor(void * parameter) {
-  esp_task_wdt_add(NULL); // Register task ke TWDT
+  esp_task_wdt_add(NULL); 
   static uint32_t emaTps = 0, emaBatt = 0, emaTemp = 0;
   
   for(;;) {
@@ -449,7 +460,6 @@ void codeTaskSensor(void * parameter) {
     adc_oneshot_read(adc1_handle, ADC_CHAN_BATT, &rawBatt);
     adc_oneshot_read(adc1_handle, ADC_CHAN_TEMP, &rawTemp);
 
-    // Konversi mV dengan kalibrasi presisi kurva bawaan ESP-IDF
     if (adc1_cali_handle) {
       adc_cali_raw_to_voltage(adc1_cali_handle, rawTps, &mvTps);
       adc_cali_raw_to_voltage(adc1_cali_handle, rawBatt, &mvBatt);
@@ -460,15 +470,13 @@ void codeTaskSensor(void * parameter) {
 
     bool isFaulty = (rawBatt < 100 || rawBatt > 4050 || rawTps > 4050 || rawTemp < 50 || rawTemp > 4050);
     
-    // Response Filter Responsif (Koefisien EMA 1/4 untuk merespons Snap Throttle cepat)
     emaTps  = (emaTps == 0)  ? (mvTps << 2)  : (emaTps - (emaTps >> 2) + mvTps);
     emaBatt = (emaBatt == 0) ? (mvBatt << 2) : (emaBatt - (emaBatt >> 2) + mvBatt);
     emaTemp = (emaTemp == 0) ? (mvTemp << 2) : (emaTemp - (emaTemp >> 2) + mvTemp);
 
     uint16_t cT = emaTps >> 2, cB = emaBatt >> 2, cTemp = emaTemp >> 2;
 
-    // Scaling tegangan mV
-    uint8_t tpsP    = mapRange(cT, 400, 3100, 0, 100); // 0.4V - 3.1V TPS range
+    uint8_t tpsP    = mapRange(cT, 400, 3100, 0, 100); 
     uint16_t battV  = mapRange(cB, 0, 3300, 0, 160);
     int16_t tempC   = mapRange(cTemp, 200, 3000, -200, 1500);
 
@@ -479,11 +487,11 @@ void codeTaskSensor(void * parameter) {
     sensorFaultStatus = isFaulty; 
     portEXIT_CRITICAL(&isrMux);
     
-    vTaskDelay(pdMS_TO_TICKS(2)); // Polling cepat 2ms
+    // Perbaikan WDT Starvation: Delay ditingkatkan ke 10ms (100Hz)
+    vTaskDelay(pdMS_TO_TICKS(10)); 
   }
 }
 
-// TAKOMETER HARDWARE VIA LEDC PWM (Bebas CPU Blocking)
 void codeTaskTachOutput(void * parameter) {
   esp_task_wdt_add(NULL);
   for (;;) {
@@ -494,10 +502,10 @@ void codeTaskTachOutput(void * parameter) {
     portEXIT_CRITICAL(&isrMux);
     
     if (rpm > 400) {
-      uint32_t freqHz = rpm / 60; // 1 Pulsa per putaran kruk as
+      uint32_t freqHz = rpm / 60; 
       if (freqHz < 1) freqHz = 1;
       ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, freqHz);
-      ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 512); // Duty cycle 50%
+      ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 512); 
       ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
     } else {
       ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
