@@ -24,7 +24,7 @@
 #include "esp_idf_version.h"
 
 // -----------------------------------------------------------------------------
-// PENYESUAIAN KOMPATIBILITAS ATENUASI ADC UNTUK ESP-IDF V5.1 DAN V5.2+
+// COMPATIBILITY ATENUASI ADC (ESP-IDF V5.1 LEBIH BARU)
 // -----------------------------------------------------------------------------
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
 #define ADC_ATTEN_TARGET ADC_ATTEN_DB_12
@@ -43,9 +43,14 @@
 #define PIN_RX_TELEMETRY GPIO_NUM_15
 #define PIN_TACH_OUT     GPIO_NUM_8
 
-// Register Akses Cepat GPIO (Direct Register Access)
-#define TCI_HIGH()       REG_WRITE(GPIO_OUT_W1TS_REG, (1UL << PIN_TCI))
-#define TCI_LOW()        REG_WRITE(GPIO_OUT_W1TC_REG, (1UL << PIN_TCI))
+// =============================================================================
+// LOGIKA OUTPUT RANTAI: ESP32 -> 6N137 -> TC4429 -> IGBT
+// 6N137 (Inverting) + TC4429 (Inverting) = LOGIKA LURUS
+// GPIO HIGH -> 6N137 Out LOW  -> TC4429 Out HIGH (12V) -> IGBT ON  (Isi/Dwell)
+// GPIO LOW  -> 6N137 Out HIGH -> TC4429 Out LOW  (0V)  -> IGBT OFF (Spark)
+// =============================================================================
+#define TCI_COIL_CHARGE() REG_WRITE(GPIO_OUT_W1TS_REG, (1UL << PIN_TCI)) // Set (3.3V)
+#define TCI_COIL_SPARK()  REG_WRITE(GPIO_OUT_W1TC_REG, (1UL << PIN_TCI)) // Clear (0V)
 
 #define ADC_CHAN_TPS     ADC_CHANNEL_0 
 #define ADC_CHAN_BATT    ADC_CHANNEL_1 
@@ -103,11 +108,11 @@ adc_oneshot_unit_handle_t adc1_handle;
 adc_cali_handle_t adc1_cali_handle = NULL;
 httpd_handle_t server = NULL;
 
-const int16_t ROTOR_PULSER_DEGREES_10 = 350; // 35.0 Derajat BTDC
+const int16_t ROTOR_PULSER_DEGREES_10 = 350; // 35.0 Derajat BTDC (Standar Satria FU)
 const uint32_t BASE_DWELL_US          = 2500;
 const uint32_t MAX_SAFETY_DWELL_US    = 3500; 
 
-const uint16_t MAX_RPM_LIMIT    = 12000; 
+const uint16_t MAX_RPM_LIMIT    = 12500; 
 const int16_t  MAX_TEMP_LIMIT10 = 1100;  // 110.0 Celcius
 
 #define NUM_RPM_POINTS 15
@@ -132,23 +137,53 @@ volatile bool isTuningActive = false;
 volatile bool wirelessActive = false;
 
 // -----------------------------------------------------------------------------
-// MAP PENGAPIAN (DRAM_ATTR & DOUBLE-BUFFERING)
+// MAP PENGAPIAN 3D (Satria FU Std + PE28 Open Filter + Knalpot Racing)
+// DRAM_ATTR & DOUBLE-BUFFERING
 // -----------------------------------------------------------------------------
 DRAM_ATTR const uint16_t rpmAxis[NUM_RPM_POINTS] = { 0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000, 12000, 13000, 14000 };
 DRAM_ATTR const uint8_t  tpsAxis[NUM_TPS_POINTS] = { 0, 25, 50, 75, 100 };
 
+// Peta Harian Optimasi PE28 Open Filter (Nilai = Derajat x 10)
 DRAM_ATTR const int16_t mapDaily3DBase[NUM_RPM_POINTS][NUM_TPS_POINTS] = {
-  {100,100,100,100,100}, {120,120,120,120,120}, {150,150,150,150,150}, {180,180,180,180,180}, {220,220,220,220,220},
-  {250,250,250,250,250}, {280,280,280,280,280}, {300,300,300,300,300}, {320,320,320,320,320}, {320,320,320,320,320},
-  {310,310,310,310,310}, {300,300,300,300,300}, {280,280,280,280,280}, {250,250,250,250,250}, {250,250,250,250,250}
+  // 0%   25%  50%  75%  100%    RPM
+  {100, 100, 100, 100, 100}, // 0
+  {100, 100, 100, 100, 100}, // 1000 (Idle)
+  {140, 150, 160, 170, 180}, // 2000
+  {180, 200, 220, 230, 240}, // 3000
+  {220, 240, 260, 270, 280}, // 4000
+  {250, 270, 290, 300, 310}, // 5000
+  {280, 300, 320, 330, 330}, // 6000
+  {300, 320, 340, 350, 350}, // 7000
+  {310, 330, 350, 360, 360}, // 8000 (Peak Power)
+  {310, 330, 350, 360, 360}, // 9000
+  {300, 320, 340, 340, 340}, // 10000
+  {280, 300, 320, 320, 320}, // 11000 (Retard Atas)
+  {260, 280, 300, 300, 300}, // 12000
+  {250, 250, 280, 280, 280}, // 13000
+  {250, 250, 250, 250, 250}  // 14000
 };
 
+// Peta Racing Agresif
 DRAM_ATTR const int16_t mapRacing3DBase[NUM_RPM_POINTS][NUM_TPS_POINTS] = {
-  {100,100,100,100,100}, {120,120,120,120,120}, {180,180,180,180,180}, {220,220,220,220,220}, {260,260,260,260,260},
-  {300,300,300,300,300}, {320,320,320,320,320}, {340,340,340,340,340}, {350,350,350,350,350}, {350,350,350,350,350},
-  {340,340,340,340,340}, {330,330,330,330,330}, {320,320,320,320,320}, {300,300,300,300,300}, {280,280,280,280,280}
+  // 0%   25%  50%  75%  100%    RPM
+  {100, 100, 100, 100, 100}, // 0
+  {120, 120, 120, 120, 120}, // 1000
+  {150, 160, 180, 190, 200}, // 2000
+  {200, 220, 240, 250, 260}, // 3000
+  {240, 260, 280, 290, 300}, // 4000
+  {270, 290, 310, 320, 330}, // 5000
+  {300, 320, 340, 350, 350}, // 6000
+  {320, 340, 360, 370, 370}, // 7000
+  {330, 350, 370, 380, 380}, // 8000
+  {330, 350, 370, 380, 380}, // 9000
+  {320, 340, 360, 360, 360}, // 10000
+  {300, 320, 340, 340, 340}, // 11000
+  {280, 300, 320, 320, 320}, // 12000
+  {260, 280, 300, 300, 300}, // 13000
+  {250, 250, 280, 280, 280}  // 14000
 };
 
+// Peta Extreme/Drag
 DRAM_ATTR const int16_t mapExtreme3DBase[NUM_RPM_POINTS][NUM_TPS_POINTS] = {
   {100,100,100,100,100}, {150,150,150,150,150}, {200,200,200,200,200}, {250,250,250,250,250}, {300,300,300,300,300},
   {330,330,330,330,330}, {350,350,350,350,350}, {370,370,370,370,370}, {380,380,380,380,380}, {380,380,380,380,380},
@@ -228,18 +263,18 @@ static inline void IRAM_ATTR fast_start_gptimer(gptimer_handle_t timer, uint32_t
 }
 
 static bool IRAM_ATTR onSafetyDwellTimer(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx) {
-  TCI_LOW(); 
+  TCI_COIL_SPARK(); 
   return false;
 }
 
 static bool IRAM_ATTR onDwellTimer(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx) {
-  TCI_LOW(); // Eksekusi Spark
+  TCI_COIL_SPARK(); 
   gptimer_stop(timerSafetyDwell);
   return false;
 }
 
 static bool IRAM_ATTR onDelayTimer(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx) {
-  TCI_HIGH(); // Mulai Dwell (Charge Coil)
+  TCI_COIL_CHARGE(); 
   
   portENTER_CRITICAL_ISR(&isrMux);
   uint32_t currentDwell = dwellUsGlobal;
@@ -260,10 +295,9 @@ static void IRAM_ATTR pulserISR(void* arg) {
 
   uint32_t interval = now - last;
   
-  // Noise filtering
   if (interval < 2500 && last != 0) return; 
   if (p_interval > 0) {
-    uint32_t min_valid_interval = (p_interval * 60) / 100; 
+    uint32_t min_valid_interval = (p_interval * 50) / 100;
     if (interval < min_valid_interval) return; 
   }
   
@@ -277,7 +311,7 @@ static void IRAM_ATTR pulserISR(void* arg) {
   if (!isSparkCut && delayUs > 0) {
     fast_start_gptimer(timerDelay, delayUs);
   } else {
-    TCI_LOW();
+    TCI_COIL_SPARK();
   }
   
   if (TaskIgnitionHandle != NULL) {
@@ -288,7 +322,7 @@ static void IRAM_ATTR pulserISR(void* arg) {
 }
 
 // -----------------------------------------------------------------------------
-// PENGOLAHAN MAP PENGAPIAN
+// PENGOLAHAN MAP PENGAPIAN 3D
 // -----------------------------------------------------------------------------
 int16_t get3DAdvanceDegreeFixed(uint16_t rpm, uint8_t tps, ModePengapian mode) {
   if (rpm < rpmAxis[0]) rpm = rpmAxis[0];
@@ -325,6 +359,7 @@ int16_t get3DAdvanceDegreeFixed(uint16_t rpm, uint8_t tps, ModePengapian mode) {
   int16_t temp = currentEngineTemp10;
   portEXIT_CRITICAL(&isrMux);
 
+  // Kompensasi Suhu Mesin (Overheat Protect)
   if (temp > MAX_TEMP_LIMIT10) { 
     finalAdv -= 20; 
     if (finalAdv < 100) finalAdv = 100; 
@@ -344,7 +379,7 @@ void codeTaskIgnition(void * parameter) {
     uint32_t ulNotificationValue = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100)); 
     
     if (ulNotificationValue == 0) {
-      TCI_LOW(); 
+      TCI_COIL_SPARK(); 
       gptimer_stop(timerDelay); 
       gptimer_stop(timerDwell); 
       gptimer_stop(timerSafetyDwell);
@@ -364,18 +399,24 @@ void codeTaskIgnition(void * parameter) {
     ModePengapian localMode = currentMode; 
     bool isTuning = isTuningActive; 
     bool isFault = sensorFaultStatus;
+    uint16_t lastRpm = currentRPM;
     portEXIT_CRITICAL(&isrMux);
 
     if (local_interval == 0) continue;
     
+    int32_t max_delta_pct = 20;
+    if (lastRpm < 3000) {
+      max_delta_pct = 45; 
+    } else if (lastRpm < 6000) {
+      max_delta_pct = 30; 
+    }
+
     int32_t interval_delta = (int32_t)local_interval - (int32_t)prev_interval;
-    int32_t max_delta = (int32_t)(prev_interval * 20 / 100);  
+    int32_t max_delta = (int32_t)(prev_interval * max_delta_pct / 100);  
     if (interval_delta > max_delta) interval_delta = max_delta;
     if (interval_delta < -max_delta) interval_delta = -max_delta;
 
     uint32_t predicted_interval = (prev_interval > 0) ? ((local_interval * 2 + prev_interval) / 3 + interval_delta) : local_interval;
-    
-    // Proteksi Pembagian dengan Nol (Divide-by-Zero Crash Protection)
     if (predicted_interval == 0) continue;
 
     prev_interval = local_interval;
@@ -392,7 +433,7 @@ void codeTaskIgnition(void * parameter) {
       portENTER_CRITICAL(&isrMux); 
       calculatedSparkCut = true; 
       portEXIT_CRITICAL(&isrMux);
-      TCI_LOW(); 
+      TCI_COIL_SPARK(); 
       continue;
     }
 
@@ -425,14 +466,13 @@ void codeTaskIgnition(void * parameter) {
       portENTER_CRITICAL(&isrMux); 
       calculatedSparkCut = true; 
       portEXIT_CRITICAL(&isrMux);
-      TCI_LOW(); 
+      TCI_COIL_SPARK(); 
       continue;
     }
 
     uint32_t finalChargeDelayUs;
     uint32_t finalDwellUs;
 
-    // Logika Penanganan Dwell Overlap
     if (sparkDelayUs > targetDwellUs) {
       finalChargeDelayUs = sparkDelayUs - targetDwellUs;
       finalDwellUs = targetDwellUs;
@@ -450,7 +490,10 @@ void codeTaskIgnition(void * parameter) {
 }
 
 long mapRange(long x, long in_min, long in_max, long out_min, long out_max) {
-  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+  long result = (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+  if (result < out_min) result = out_min;
+  if (result > out_max) result = out_max;
+  return result;
 }
 
 void codeTaskSensor(void * parameter) {
@@ -464,7 +507,11 @@ void codeTaskSensor(void * parameter) {
     int mvTps = 0, mvBatt = 0, mvTemp = 0;
 
     adc_oneshot_read(adc1_handle, ADC_CHAN_TPS, &rawTps);
+    esp_rom_delay_us(100);
+
     adc_oneshot_read(adc1_handle, ADC_CHAN_BATT, &rawBatt);
+    esp_rom_delay_us(100);
+
     adc_oneshot_read(adc1_handle, ADC_CHAN_TEMP, &rawTemp);
 
     if (adc1_cali_handle) {
@@ -475,17 +522,22 @@ void codeTaskSensor(void * parameter) {
       mvTps = rawTps; mvBatt = rawBatt; mvTemp = rawTemp;
     }
 
+    // Cek fault sensor (Batas kriting batas aman ADC ESP32-S3)
     bool isFaulty = (rawBatt < 100 || rawBatt > 4050 || rawTps > 4050 || rawTemp < 50 || rawTemp > 4050);
     
+    // Low-Pass Filter Exponential Moving Average (EMA)
     emaTps  = (emaTps == 0)  ? (mvTps << 2)  : (emaTps - (emaTps >> 2) + mvTps);
     emaBatt = (emaBatt == 0) ? (mvBatt << 2) : (emaBatt - (emaBatt >> 2) + mvBatt);
     emaTemp = (emaTemp == 0) ? (mvTemp << 2) : (emaTemp - (emaTemp >> 2) + mvTemp);
 
     uint16_t cT = emaTps >> 2, cB = emaBatt >> 2, cTemp = emaTemp >> 2;
 
-    uint8_t tpsP    = mapRange(cT, 400, 3100, 0, 100); 
-    uint16_t battV  = mapRange(cB, 0, 3300, 0, 160);
-    int16_t tempC   = mapRange(cTemp, 200, 3000, -200, 1500);
+    // KALIBRASI SENSOR TPS SATRIA FU ORI MODIFIKASI:
+    // Pada tegangan 3.3V ESP32 (atau via pembagi tegangan 5V->3.3V):
+    // TPS tertutup ~450 mV | TPS Buka Mentok ~2800 mV
+    uint8_t tpsP    = (uint8_t)mapRange(cT, 450, 2800, 0, 100); 
+    uint16_t battV  = (uint16_t)mapRange(cB, 0, 3100, 0, 160); // 0-16.0 Volt
+    int16_t tempC   = (int16_t)mapRange(cTemp, 300, 2800, -200, 1500); // Sensor NTC -20.0C s/d 150.0C
 
     portENTER_CRITICAL(&isrMux);
     currentTPS = tpsP; 
@@ -575,7 +627,7 @@ void codeTaskCommandListener(void * parameter) {
 // WI-FI & WEBSERVER
 // -----------------------------------------------------------------------------
 esp_err_t root_get_handler(httpd_req_t *req) {
-  httpd_resp_send(req, "TCI Dashboard Ready", HTTPD_RESP_USE_STRLEN); 
+  httpd_resp_send(req, "TCI Satria FU Dashboard Ready", HTTPD_RESP_USE_STRLEN); 
   return ESP_OK;
 }
 
@@ -613,6 +665,7 @@ void codeTaskNetwork(void * parameter) {
     stateW = wirelessActive; 
     portEXIT_CRITICAL(&isrMux);
     
+    // Otomatis matikan Wi-Fi saat mesin running
     if ((st == STATE_CRANKING || st == STATE_RUNNING) && stateW) {
       setWirelessState(false);
     }
@@ -642,7 +695,6 @@ void codeTaskNetwork(void * parameter) {
 // SETUP UTAMA ESP-IDF (app_main)
 // -----------------------------------------------------------------------------
 void app_main(void) {
-  // 1. Inisialisasi Task Watchdog Timer (TWDT) PERTAMA SEBELUM PEMBUATAN TASK
   esp_task_wdt_config_t twdt_config = { 
     .timeout_ms = WDT_TIMEOUT_SECONDS * 1000, 
     .idle_core_mask = (1 << 0) | (1 << 1), 
@@ -650,7 +702,8 @@ void app_main(void) {
   };
   esp_task_wdt_init(&twdt_config);
 
-  // Config GPIO Output Initial Level
+  // Pin Output TCI Pin 17
+  // Internal Pull-Down aktif agar pin pasti 0V saat booting (LED 6N137 OFF = IGBT OFF)
   gpio_config_t io_out = {
     .pin_bit_mask = (1ULL << PIN_TCI),
     .mode = GPIO_MODE_OUTPUT,
@@ -659,7 +712,9 @@ void app_main(void) {
     .intr_type = GPIO_INTR_DISABLE
   };
   gpio_config(&io_out); 
-  TCI_LOW(); 
+  
+  // Paksa pin ke LOW awal booting
+  TCI_COIL_SPARK(); 
   
   // Config GPIO Input Buttons
   gpio_config_t io_in = {
@@ -671,7 +726,7 @@ void app_main(void) {
   };
   gpio_config(&io_in);
 
-  // Inisialisasi LEDC PWM untuk Takometer
+  // Inisialisasi LEDC PWM untuk Takometer Motor
   ledc_timer_config_t ledc_timer = {
     .speed_mode       = LEDC_LOW_SPEED_MODE,
     .timer_num        = LEDC_TIMER_0,
@@ -692,14 +747,14 @@ void app_main(void) {
   };
   ledc_channel_config(&ledc_channel);
 
-  // Init NVS
+  // Init NVS Flash Memory
   esp_err_t ret = nvs_flash_init();
   if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) { 
     nvs_flash_erase(); 
     nvs_flash_init(); 
   }
   
-  // Init UART
+  // Init UART Telemetri
   uart_config_t uart_cfg = { 
     .baud_rate = 250000, 
     .data_bits = UART_DATA_8_BITS, 
@@ -711,7 +766,7 @@ void app_main(void) {
   uart_set_pin(UART_NUM_2, PIN_TX_TELEMETRY, PIN_RX_TELEMETRY, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
   uart_driver_install(UART_NUM_2, 256, 0, 0, NULL, 0);
 
-  // Init ADC Oneshot + Curve Fitting Calibration (Diperbaiki untuk ESP-IDF v5.1)
+  // Init ADC Oneshot
   adc_oneshot_unit_init_cfg_t init_config1 = { .unit_id = ADC_UNIT_1 }; 
   adc_oneshot_new_unit(&init_config1, &adc1_handle);
   
@@ -730,7 +785,7 @@ void app_main(void) {
   };
   adc_cali_create_scheme_curve_fitting(&cali_config, &adc1_cali_handle);
 
-  // Init GPTimer
+  // Init GPTimer Hardware High-Precision Timers
   gptimer_config_t timer_cfg = { 
     .clk_src = GPTIMER_CLK_SRC_DEFAULT, 
     .direction = GPTIMER_COUNT_UP, 
@@ -753,7 +808,7 @@ void app_main(void) {
 
   // Init Wi-Fi SoftAP
   esp_netif_init(); 
-  esp_event_loop_create_default(); 
+  esp_event_loop_createdefault(); 
   esp_netif_create_default_wifi_ap();
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT(); 
   esp_wifi_init(&cfg);
@@ -772,7 +827,7 @@ void app_main(void) {
   
   loadCustomMap();
 
-  // Pembuatan Task Dilakukan Setelah Watchdog Siap
+  // Pembuatan Tasks (FreeRTOS Dual-Core distribution)
   xTaskCreatePinnedToCore(codeTaskNetwork, "TaskNet", 4096, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(codeTaskSensor, "TaskSens", 3072, NULL, 5, NULL, 0);
   xTaskCreatePinnedToCore(codeTaskIgnition, "TaskIgn", 4096, NULL, 24, &TaskIgnitionHandle, 1);
@@ -780,7 +835,7 @@ void app_main(void) {
   xTaskCreatePinnedToCore(codeTaskCommandListener, "TaskCmd", 2048, NULL, 2, NULL, 0);
   xTaskCreatePinnedToCore(codeTaskTachOutput, "TaskTach", 2048, NULL, 2, NULL, 0);
   
-  // Interrupt Pulser (Negedge Falling)
+  // Interrupt Pulser Pin 4 (Falling Edge dari Optocoupler Pulser)
   gpio_config_t io_puls = { 
     .pin_bit_mask = (1ULL << PIN_PULSER), 
     .mode = GPIO_MODE_INPUT, 
