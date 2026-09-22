@@ -19,6 +19,7 @@
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "soc/gpio_struct.h"
+#include "soc/gpio_reg.h"
 
 // -----------------------------------------------------------------------------
 // KONFIGURASI HARDWARE & PIN ESP32-S3
@@ -32,8 +33,8 @@
 #define PIN_TACH_OUT     GPIO_NUM_8
 
 // Register Akses Cepat GPIO (Direct Register Access untuk memotong overhead ISR)
-#define TCI_HIGH()       (GPIO.out_w1ts.val = (1 << PIN_TCI))
-#define TCI_LOW()        (GPIO.out_w1tc.val = (1 << PIN_TCI))
+#define TCI_HIGH()       REG_WRITE(GPIO_OUT_W1TS_REG, (1UL << PIN_TCI))
+#define TCI_LOW()        REG_WRITE(GPIO_OUT_W1TC_REG, (1UL << PIN_TCI))
 
 // Kanal ADC1 ESP32-S3
 #define ADC_CHAN_TPS     ADC_CHANNEL_0 // GPIO 1
@@ -691,14 +692,14 @@ void app_main(void) {
   // Init ADC Oneshot + Curve Fitting Calibration
   adc_oneshot_unit_init_cfg_t init_config1 = { .unit_id = ADC_UNIT_1 }; 
   adc_oneshot_new_unit(&init_config1, &adc1_handle);
-  adc_oneshot_chan_cfg_t config = { .bitwidth = ADC_BITWIDTH_12, .atten = ADC_ATTEN_DB_12 };
+  adc_oneshot_chan_cfg_t config = { .bitwidth = ADC_BITWIDTH_12, .atten = ADC_ATTEN_DB_11 };
   adc_oneshot_config_channel(adc1_handle, ADC_CHAN_TPS, &config); 
   adc_oneshot_config_channel(adc1_handle, ADC_CHAN_BATT, &config); 
   adc_oneshot_config_channel(adc1_handle, ADC_CHAN_TEMP, &config);
 
   adc_cali_curve_fitting_config_t cali_config = {
     .unit_id = ADC_UNIT_1,
-    .atten = ADC_ATTEN_DB_12,
+    .atten = ADC_ATTEN_DB_11,
     .bitwidth = ADC_BITWIDTH_12,
   };
   adc_cali_create_scheme_curve_fitting(&cali_config, &adc1_cali_handle);
