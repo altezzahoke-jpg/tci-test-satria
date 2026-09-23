@@ -22,10 +22,8 @@
 #include "soc/gpio_struct.h"
 #include "soc/gpio_reg.h"
 #include "esp_idf_version.h"
+#include "esp_netif.h"
 
-// -----------------------------------------------------------------------------
-// COMPATIBILITY ATENUASI ADC (ESP-IDF V5.1 LEBIH BARU)
-// -----------------------------------------------------------------------------
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
 #define ADC_ATTEN_TARGET ADC_ATTEN_DB_12
 #else
@@ -43,9 +41,8 @@
 #define PIN_RX_TELEMETRY GPIO_NUM_15
 #define PIN_TACH_OUT     GPIO_NUM_8
 
-// LOGIKA OUTPUT RANTAI TCI
-#define TCI_COIL_CHARGE() REG_WRITE(GPIO_OUT_W1TS_REG, (1UL << PIN_TCI)) // Set (3.3V)
-#define TCI_COIL_SPARK()  REG_WRITE(GPIO_OUT_W1TC_REG, (1UL << PIN_TCI)) // Clear (0V)
+#define TCI_COIL_CHARGE() REG_WRITE(GPIO_OUT_W1TS_REG, (1UL << PIN_TCI)) 
+#define TCI_COIL_SPARK()  REG_WRITE(GPIO_OUT_W1TC_REG, (1UL << PIN_TCI)) 
 
 #define ADC_CHAN_TPS     ADC_CHANNEL_0 
 #define ADC_CHAN_BATT    ADC_CHANNEL_1 
@@ -53,15 +50,12 @@
 
 #define WDT_TIMEOUT_SECONDS 2
 #define AP_SSID "TCI_SatriaFU_Pro"
-#define AP_PASS "12345678"
-
-static const char *TAG __attribute__((unused)) = "TCI_IDF_PRO";
+#define AP_PASS "12345678" 
+#define API_SECRET_TOKEN "satria123"
 
 portMUX_TYPE isrMux = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE webMux = portMUX_INITIALIZER_UNLOCKED;
 
-// -----------------------------------------------------------------------------
-// FINITE STATE MACHINE (FSM) & STRUKTUR DATA
-// -----------------------------------------------------------------------------
 typedef enum { 
   STATE_STOPPED = 0, 
   STATE_CRANKING, 
@@ -92,9 +86,6 @@ typedef struct {
 } CommandData;
 #pragma pack(pop)
 
-// -----------------------------------------------------------------------------
-// HARDWARE TIMERS, ADC CALIBRATION & VARIABEL GLOBAL
-// -----------------------------------------------------------------------------
 gptimer_handle_t timerDelay = NULL;
 gptimer_handle_t timerDwell = NULL;
 gptimer_handle_t timerSafetyDwell = NULL;
@@ -103,17 +94,18 @@ adc_oneshot_unit_handle_t adc1_handle;
 adc_cali_handle_t adc1_cali_handle = NULL;
 httpd_handle_t server = NULL;
 
-// Sinyal pulser fisik berada pada 35.0 Derajat BTDC
 const int16_t ROTOR_PULSER_DEGREES_10 = 350; 
 const uint32_t BASE_DWELL_US          = 2500;
 const uint32_t MAX_SAFETY_DWELL_US    = 3500; 
 
 const uint16_t MAX_RPM_LIMIT    = 12500; 
-const int16_t  MAX_TEMP_LIMIT10 = 1100;  // 110.0 Celcius
+const int16_t  MAX_TEMP_LIMIT10 = 1100;  
 
 #define NUM_RPM_POINTS 15
 #define NUM_TPS_POINTS 5
 #define MAX_CUSTOM_SLOTS 5
+
+static char web_post_buffer[4096]; 
 
 typedef enum { MODE_DAILY = 0, MODE_RACING, MODE_EXTREME, MODE_CUSTOM } ModePengapian;
 typedef enum { BBM_PERTALITE = 0, BBM_PERTAMAX } JenisBBM;
@@ -130,71 +122,65 @@ volatile int16_t  currentDegree10         = 100;
 volatile bool     sensorFaultStatus       = false;
 
 volatile bool isTuningActive = false;
-volatile bool wirelessActive = false;
+volatile bool wirelessActive = false; 
 
-// -----------------------------------------------------------------------------
-// MAP PENGAPIAN 3D
-// -----------------------------------------------------------------------------
 DRAM_ATTR const uint16_t rpmAxis[NUM_RPM_POINTS] = { 0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000, 12000, 13000, 14000 };
 DRAM_ATTR const uint8_t  tpsAxis[NUM_TPS_POINTS] = { 0, 25, 50, 75, 100 };
 
+// Map Base Daily (Standar/Aman)
 DRAM_ATTR const int16_t mapDaily3DBase[NUM_RPM_POINTS][NUM_TPS_POINTS] = {
-  {100, 100, 100, 100, 100},
-  {100, 100, 100, 100, 100},
-  {140, 150, 160, 170, 180},
-  {180, 200, 220, 230, 240},
-  {220, 240, 260, 270, 280},
-  {250, 270, 290, 300, 310},
-  {280, 300, 320, 330, 330},
-  {300, 320, 340, 350, 350},
-  {310, 330, 350, 350, 350},
-  {310, 330, 350, 350, 350},
-  {300, 320, 340, 340, 340},
-  {280, 300, 320, 320, 320},
-  {260, 280, 300, 300, 300},
-  {250, 250, 280, 280, 280},
-  {250, 250, 250, 250, 250}
+  {100, 100, 100, 100, 100}, {100, 100, 100, 100, 100}, {140, 150, 160, 170, 180},
+  {180, 200, 220, 230, 240}, {220, 240, 260, 270, 280}, {250, 270, 290, 300, 310},
+  {280, 300, 320, 330, 330}, {300, 320, 340, 350, 350}, {310, 330, 350, 350, 350},
+  {310, 330, 350, 350, 350}, {300, 320, 340, 340, 340}, {280, 300, 320, 320, 320},
+  {260, 280, 300, 300, 300}, {250, 250, 280, 280, 280}, {250, 250, 250, 250, 250}
 };
 
+// Map Racing (Kurva lebih agresif di putaran menengah)
 DRAM_ATTR const int16_t mapRacing3DBase[NUM_RPM_POINTS][NUM_TPS_POINTS] = {
-  {100, 100, 100, 100, 100},
-  {120, 120, 120, 120, 120},
-  {150, 160, 180, 190, 200},
-  {200, 220, 240, 250, 260},
-  {240, 260, 280, 290, 300},
-  {270, 290, 310, 320, 330},
-  {300, 320, 340, 350, 350},
-  {320, 340, 350, 350, 350},
-  {330, 350, 350, 350, 350},
-  {330, 350, 350, 350, 350},
-  {320, 340, 350, 350, 350},
-  {300, 320, 340, 340, 340},
-  {280, 300, 320, 320, 320},
-  {260, 280, 300, 300, 300},
-  {250, 250, 280, 280, 280}
+  {100, 100, 100, 100, 100}, {100, 100, 100, 100, 100}, {160, 170, 180, 190, 200},
+  {210, 230, 250, 260, 270}, {250, 270, 290, 300, 310}, {280, 300, 320, 330, 340},
+  {310, 330, 350, 360, 370}, {330, 350, 370, 380, 390}, {340, 360, 380, 390, 390},
+  {340, 360, 380, 390, 390}, {330, 350, 370, 380, 380}, {310, 330, 350, 360, 360},
+  {290, 310, 330, 340, 340}, {270, 290, 310, 320, 320}, {260, 270, 280, 280, 280}
 };
 
+// Map Extreme (Kurva sangat agresif, butuh oktan tinggi)
 DRAM_ATTR const int16_t mapExtreme3DBase[NUM_RPM_POINTS][NUM_TPS_POINTS] = {
-  {100,100,100,100,100}, {150,150,150,150,150}, {200,200,200,200,200}, {250,250,250,250,250}, {300,300,300,300,300},
-  {330,330,330,330,330}, {350,350,350,350,350}, {350,350,350,350,350}, {350,350,350,350,350}, {350,350,350,350,350},
-  {350,350,350,350,350}, {350,350,350,350,350}, {350,350,350,350,350}, {330,330,330,330,330}, {300,300,300,300,300}
+  {100, 100, 100, 100, 100}, {100, 100, 100, 100, 100}, {180, 190, 200, 210, 220},
+  {240, 260, 280, 290, 300}, {280, 300, 320, 330, 340}, {310, 330, 350, 360, 370},
+  {340, 360, 380, 390, 400}, {360, 380, 400, 410, 420}, {370, 390, 410, 420, 420},
+  {370, 390, 410, 420, 420}, {360, 380, 400, 410, 410}, {340, 360, 380, 390, 390},
+  {320, 340, 360, 370, 370}, {300, 320, 340, 350, 350}, {280, 290, 300, 300, 300}
 };
 
 DRAM_ATTR int16_t mapCustomSlots[MAX_CUSTOM_SLOTS][NUM_RPM_POINTS][NUM_TPS_POINTS];
 DRAM_ATTR int16_t activeCustomMapBuffer[2][NUM_RPM_POINTS][NUM_TPS_POINTS];
 volatile uint8_t activeMapIndex = 0;
 
-volatile uint32_t last_pulse_time = 0;
-volatile uint32_t pulse_interval  = 0;
+volatile uint64_t last_pulse_time = 0;
+volatile uint64_t pulse_interval  = 0;
+volatile uint64_t prev_interval   = 0; 
+
 volatile uint32_t dwellUsGlobal = 2500; 
-volatile uint32_t calculatedChargeDelayUs = 1000;
-volatile bool     calculatedSparkCut = false;
 
-TaskHandle_t TaskIgnitionHandle = NULL;
+static inline bool isEngineStopped(void) {
+  portENTER_CRITICAL(&isrMux);
+  EngineState st = currentEngineState;
+  uint16_t rpm = currentRPM;
+  portEXIT_CRITICAL(&isrMux);
+  return (st == STATE_STOPPED && rpm == 0);
+}
 
-// -----------------------------------------------------------------------------
-// UTILITY: CRC16 & LOCK-FREE BUFFER SWAP
-// -----------------------------------------------------------------------------
+void logDTC(const char* errorCode) {
+  nvs_handle_t my_handle;
+  if (nvs_open("ecu_dtc", NVS_READWRITE, &my_handle) == ESP_OK) {
+    nvs_set_str(my_handle, "last_dtc", errorCode);
+    nvs_commit(my_handle);
+    nvs_close(my_handle);
+  }
+}
+
 uint16_t calculateCRC16(const uint8_t *data, size_t len) {
   uint16_t crc = 0xFFFF;
   for (size_t i = 0; i < len; i++) {
@@ -210,10 +196,25 @@ uint16_t calculateCRC16(const uint8_t *data, size_t len) {
 void updateActiveMapBuffer(void) {
   uint8_t slot = currentCustomSlot;
   if (slot >= MAX_CUSTOM_SLOTS) slot = 0;
-  
   uint8_t nextBufferIndex = 1 - activeMapIndex;
   memcpy(activeCustomMapBuffer[nextBufferIndex], mapCustomSlots[slot], sizeof(activeCustomMapBuffer[0]));
+  portENTER_CRITICAL(&isrMux);
   activeMapIndex = nextBufferIndex;
+  portEXIT_CRITICAL(&isrMux);
+}
+
+esp_err_t saveCustomMapToNVS(uint8_t slot) {
+  if (slot >= MAX_CUSTOM_SLOTS) return ESP_ERR_INVALID_ARG;
+  nvs_handle_t my_handle;
+  esp_err_t err = nvs_open("ecu_maps", NVS_READWRITE, &my_handle);
+  if (err == ESP_OK) {
+    char keyMap[16];
+    snprintf(keyMap, sizeof(keyMap), "map%d", slot);
+    err = nvs_set_blob(my_handle, keyMap, &mapCustomSlots[slot], sizeof(mapCustomSlots[slot]));
+    if (err == ESP_OK) nvs_commit(my_handle);
+    nvs_close(my_handle);
+  }
+  return err;
 }
 
 void loadCustomMap(void) {
@@ -236,10 +237,8 @@ void loadCustomMap(void) {
   updateActiveMapBuffer();
 }
 
-// -----------------------------------------------------------------------------
-// HIGH-PERFORMANCE ISR & SAFE TIMER SETTING
-// -----------------------------------------------------------------------------
 static inline void IRAM_ATTR fast_set_gptimer_alarm(gptimer_handle_t timer, uint32_t delay_us) {
+  gptimer_stop(timer); 
   gptimer_alarm_config_t alarm_config = {
     .alarm_count = delay_us,
     .reload_count = 0,
@@ -263,7 +262,6 @@ static bool IRAM_ATTR onDwellTimer(gptimer_handle_t timer, const gptimer_alarm_e
 
 static bool IRAM_ATTR onDelayTimer(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx) {
   TCI_COIL_CHARGE(); 
-  
   portENTER_CRITICAL_ISR(&isrMux);
   uint32_t currentDwell = dwellUsGlobal;
   portEXIT_CRITICAL_ISR(&isrMux);
@@ -273,46 +271,7 @@ static bool IRAM_ATTR onDelayTimer(gptimer_handle_t timer, const gptimer_alarm_e
   return false;
 }
 
-static void IRAM_ATTR pulserISR(void* arg) {
-  uint32_t now = esp_timer_get_time();
-  
-  portENTER_CRITICAL_ISR(&isrMux);
-  uint32_t last = last_pulse_time;
-  uint32_t p_interval = pulse_interval;
-  portEXIT_CRITICAL_ISR(&isrMux);
-
-  uint32_t interval = now - last;
-  
-  if (interval < 2500 && last != 0) return; 
-  if (p_interval > 0) {
-    uint32_t min_valid_interval = (p_interval * 50) / 100;
-    if (interval < min_valid_interval) return; 
-  }
-  
-  portENTER_CRITICAL_ISR(&isrMux); 
-  pulse_interval = interval;
-  last_pulse_time = now;
-  bool isSparkCut = calculatedSparkCut;
-  uint32_t delayUs = calculatedChargeDelayUs;
-  portEXIT_CRITICAL_ISR(&isrMux);
-
-  if (!isSparkCut && delayUs > 0) {
-    fast_set_gptimer_alarm(timerDelay, delayUs);
-  } else {
-    TCI_COIL_SPARK();
-  }
-  
-  if (TaskIgnitionHandle != NULL) {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    vTaskNotifyGiveFromISR(TaskIgnitionHandle, &xHigherPriorityTaskWoken);
-    if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
-  }
-}
-
-// -----------------------------------------------------------------------------
-// PENGOLAHAN MAP PENGAPIAN 3D
-// -----------------------------------------------------------------------------
-int16_t get3DAdvanceDegreeFixed(uint16_t rpm, uint8_t tps, ModePengapian mode) {
+int16_t IRAM_ATTR get3DAdvanceDegreeFixed(uint16_t rpm, uint8_t tps, ModePengapian mode) {
   if (rpm < rpmAxis[0]) rpm = rpmAxis[0];
   if (rpm > rpmAxis[NUM_RPM_POINTS - 1]) rpm = rpmAxis[NUM_RPM_POINTS - 1];
   if (tps > 100) tps = 100;
@@ -323,12 +282,16 @@ int16_t get3DAdvanceDegreeFixed(uint16_t rpm, uint8_t tps, ModePengapian mode) {
   uint8_t r1 = r0 + 1, t1 = t0 + 1;
 
   int16_t q11, q21, q12, q22;
+  
   if (mode == MODE_DAILY) {
-    q11 = mapDaily3DBase[r0][t0]; q21 = mapDaily3DBase[r1][t0]; q12 = mapDaily3DBase[r0][t1]; q22 = mapDaily3DBase[r1][t1];
+    q11 = mapDaily3DBase[r0][t0]; q21 = mapDaily3DBase[r1][t0]; 
+    q12 = mapDaily3DBase[r0][t1]; q22 = mapDaily3DBase[r1][t1];
   } else if (mode == MODE_RACING) {
-    q11 = mapRacing3DBase[r0][t0]; q21 = mapRacing3DBase[r1][t0]; q12 = mapRacing3DBase[r0][t1]; q22 = mapRacing3DBase[r1][t1];
+    q11 = mapRacing3DBase[r0][t0]; q21 = mapRacing3DBase[r1][t0]; 
+    q12 = mapRacing3DBase[r0][t1]; q22 = mapRacing3DBase[r1][t1];
   } else if (mode == MODE_EXTREME) {
-    q11 = mapExtreme3DBase[r0][t0]; q21 = mapExtreme3DBase[r1][t0]; q12 = mapExtreme3DBase[r0][t1]; q22 = mapExtreme3DBase[r1][t1];
+    q11 = mapExtreme3DBase[r0][t0]; q21 = mapExtreme3DBase[r1][t0]; 
+    q12 = mapExtreme3DBase[r0][t1]; q22 = mapExtreme3DBase[r1][t1];
   } else {
     uint8_t bufIdx = activeMapIndex;
     q11 = activeCustomMapBuffer[bufIdx][r0][t0]; 
@@ -343,142 +306,109 @@ int16_t get3DAdvanceDegreeFixed(uint16_t rpm, uint8_t tps, ModePengapian mode) {
   int32_t R2 = q12 + ((q22 - q12) * rF) / 1024;
   int16_t finalAdv = (int16_t)(R1 + ((R2 - R1) * tF) / 1024);
 
-  portENTER_CRITICAL(&isrMux);
   int16_t temp = currentEngineTemp10;
-  portEXIT_CRITICAL(&isrMux);
-
   if (temp > MAX_TEMP_LIMIT10) { 
     finalAdv -= 20; 
     if (finalAdv < 100) finalAdv = 100; 
   }
 
-  if (finalAdv > ROTOR_PULSER_DEGREES_10) {
-    finalAdv = ROTOR_PULSER_DEGREES_10;
-  }
-
+  if (finalAdv > ROTOR_PULSER_DEGREES_10) finalAdv = ROTOR_PULSER_DEGREES_10;
   return finalAdv;
 }
 
-// -----------------------------------------------------------------------------
-// TASKS
-// -----------------------------------------------------------------------------
-void codeTaskIgnition(void * parameter) {
-  esp_task_wdt_add(NULL); 
-  uint32_t prev_interval = 0;
+static void IRAM_ATTR pulserISR(void* arg) {
+  uint64_t now = esp_timer_get_time(); 
   
-  for (;;) {
-    esp_task_wdt_reset(); 
-    uint32_t ulNotificationValue = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100)); 
-    
-    // PROTEKSI THERMAL RUNAWAY COIL (Jika 100ms tidak ada pulsa)
-    if (ulNotificationValue == 0) {
-      TCI_COIL_SPARK(); 
-      gptimer_stop(timerDelay); 
-      gptimer_stop(timerDwell); 
-      gptimer_stop(timerSafetyDwell);
-      portENTER_CRITICAL(&isrMux); 
-      currentRPM = 0; 
-      currentEngineState = STATE_STOPPED; 
-      calculatedSparkCut = true; 
-      portEXIT_CRITICAL(&isrMux);
-      prev_interval = 0; 
-      continue;
-    }
+  portENTER_CRITICAL_ISR(&isrMux);
+  uint64_t last = last_pulse_time;
+  uint64_t p_interval = pulse_interval;
+  uint64_t local_prev = prev_interval;
+  uint8_t localTPS = currentTPS; 
+  uint16_t localBatt10 = currentBatteryVoltage10;
+  ModePengapian localMode = currentMode; 
+  bool isTuning = isTuningActive; 
+  bool isFault = sensorFaultStatus;
+  portEXIT_CRITICAL_ISR(&isrMux);
 
-    portENTER_CRITICAL(&isrMux);
-    uint32_t local_interval = pulse_interval; 
-    uint8_t localTPS = currentTPS; 
-    uint16_t localBatt10 = currentBatteryVoltage10;
-    ModePengapian localMode = currentMode; 
-    bool isTuning = isTuningActive; 
-    bool isFault = sensorFaultStatus;
-    uint16_t lastRpm = currentRPM;
-    portEXIT_CRITICAL(&isrMux);
-
-    if (local_interval == 0) continue;
-    
-    int32_t max_delta_pct = (lastRpm < 3000) ? 45 : ((lastRpm < 6000) ? 30 : 20);
-    int32_t interval_delta = (int32_t)local_interval - (int32_t)prev_interval;
-    int32_t max_delta = (int32_t)(prev_interval * max_delta_pct / 100);  
-    if (interval_delta > max_delta) interval_delta = max_delta;
-    if (interval_delta < -max_delta) interval_delta = -max_delta;
-
-    uint32_t predicted_interval = (prev_interval > 0) ? ((local_interval * 2 + prev_interval) / 3 + interval_delta) : local_interval;
-    if (predicted_interval == 0) continue;
-
-    prev_interval = local_interval;
-    uint16_t rpm = (uint16_t)(60000000UL / predicted_interval);
-    
-    EngineState newState = (isFault) ? STATE_LIMP_HOME : ((rpm < 600) ? STATE_CRANKING : STATE_RUNNING);
-    
-    portENTER_CRITICAL(&isrMux); 
-    currentRPM = rpm; 
-    currentEngineState = newState; 
-    portEXIT_CRITICAL(&isrMux);
-
-    if (isTuning || rpm > MAX_RPM_LIMIT || (newState == STATE_LIMP_HOME && rpm > 4000)) {
-      portENTER_CRITICAL(&isrMux); 
-      calculatedSparkCut = true; 
-      portEXIT_CRITICAL(&isrMux);
-      TCI_COIL_SPARK(); 
-      continue;
-    }
-
-    int16_t adv10; 
-    uint32_t targetDwellUs;
-    
-    // PERBAIKAN LOGIKA: Pemisahan state untuk pengamanan kompresi mesin
-    if (newState == STATE_LIMP_HOME) {
-      adv10 = 100; // 10.0 Derajat aman 
-      targetDwellUs = 2500; 
-    } else if (newState == STATE_CRANKING) {
-      adv10 = 50;  // 5.0 Derajat statis: Bypass interpolasi 3D agar anti-kickback
-      targetDwellUs = 3000;
-    } else {
-      adv10 = get3DAdvanceDegreeFixed(rpm, localTPS, localMode);
-      if (localBatt10 <= 100) targetDwellUs = 3500;
-      else if (localBatt10 >= 150) targetDwellUs = 2000;
-      else targetDwellUs = 3500 - ((uint32_t)(localBatt10 - 100) * 1500) / 50;
-    }
-    
-    portENTER_CRITICAL(&isrMux); 
-    currentDegree10 = adv10; 
-    portEXIT_CRITICAL(&isrMux);
-
-    uint32_t maxAllowedDwell = predicted_interval * 7 / 10;
-    if (targetDwellUs > maxAllowedDwell) targetDwellUs = maxAllowedDwell;
-    if (targetDwellUs > MAX_SAFETY_DWELL_US) targetDwellUs = MAX_SAFETY_DWELL_US;
-    if (targetDwellUs < 800) targetDwellUs = 800; 
-
-    int16_t sparkDegFromPulser = ROTOR_PULSER_DEGREES_10 - adv10;
-    if (sparkDegFromPulser < 0) sparkDegFromPulser = 0;
-    uint32_t sparkDelayUs = (uint32_t)(((uint64_t)sparkDegFromPulser * predicted_interval) / 3600ULL);
-    
-    if (sparkDelayUs >= predicted_interval) {
-      portENTER_CRITICAL(&isrMux); 
-      calculatedSparkCut = true; 
-      portEXIT_CRITICAL(&isrMux);
-      TCI_COIL_SPARK(); 
-      continue;
-    }
-
-    uint32_t finalChargeDelayUs;
-    uint32_t finalDwellUs;
-
-    if (sparkDelayUs > targetDwellUs) {
-      finalChargeDelayUs = sparkDelayUs - targetDwellUs;
-      finalDwellUs = targetDwellUs;
-    } else {
-      finalChargeDelayUs = 5; 
-      finalDwellUs = (sparkDelayUs > 10) ? (sparkDelayUs - 5) : 5;
-    }
-
-    portENTER_CRITICAL(&isrMux);
-    dwellUsGlobal = finalDwellUs; 
-    calculatedChargeDelayUs = finalChargeDelayUs; 
-    calculatedSparkCut = false;
-    portEXIT_CRITICAL(&isrMux);
+  uint64_t interval = now - last;
+  
+  if (interval < 2500 && last != 0) return; 
+  if (p_interval > 0) {
+    uint64_t min_valid_interval = (p_interval * 30) / 100;
+    if (interval < min_valid_interval) return; 
   }
+  
+  int64_t max_delta_pct = 30;
+  int64_t interval_delta = (int64_t)interval - (int64_t)local_prev;
+  int64_t max_delta = (int64_t)(local_prev * max_delta_pct / 100);  
+  if (interval_delta > max_delta) interval_delta = max_delta;
+  if (interval_delta < -max_delta) interval_delta = -max_delta;
+
+  uint64_t predicted_interval = (local_prev > 0) ? ((interval * 2 + local_prev) / 3 + interval_delta) : interval;
+  
+  uint16_t rpm = 0;
+  if (predicted_interval > 0) rpm = (uint16_t)(60000000ULL / predicted_interval);
+  
+  EngineState newState = (isFault) ? STATE_LIMP_HOME : ((rpm < 600) ? STATE_CRANKING : STATE_RUNNING);
+
+  portENTER_CRITICAL_ISR(&isrMux); 
+  pulse_interval = interval;
+  last_pulse_time = now;
+  prev_interval = interval;
+  currentRPM = rpm;
+  currentEngineState = newState;
+  portEXIT_CRITICAL_ISR(&isrMux);
+
+  if (isTuning || rpm > MAX_RPM_LIMIT || (newState == STATE_LIMP_HOME && rpm > 4000) || predicted_interval == 0) {
+    TCI_COIL_SPARK();
+    return;
+  }
+
+  int16_t adv10; 
+  uint32_t targetDwellUs;
+  
+  if (newState == STATE_LIMP_HOME) {
+    adv10 = 100; 
+    targetDwellUs = 2500; 
+  } else if (newState == STATE_CRANKING) {
+    adv10 = 50;  
+    targetDwellUs = 3000;
+  } else {
+    adv10 = get3DAdvanceDegreeFixed(rpm, localTPS, localMode);
+    if (localBatt10 <= 100) targetDwellUs = 3500;
+    else if (localBatt10 >= 150) targetDwellUs = 2000;
+    else targetDwellUs = 3500 - ((uint32_t)(localBatt10 - 100) * 1500) / 50;
+  }
+  
+  currentDegree10 = adv10; 
+
+  uint32_t maxAllowedDwell = (uint32_t)(predicted_interval * 7 / 10);
+  if (targetDwellUs > maxAllowedDwell) targetDwellUs = maxAllowedDwell;
+  if (targetDwellUs > MAX_SAFETY_DWELL_US) targetDwellUs = MAX_SAFETY_DWELL_US;
+  if (targetDwellUs < 800) targetDwellUs = 800; 
+
+  int16_t sparkDegFromPulser = ROTOR_PULSER_DEGREES_10 - adv10;
+  if (sparkDegFromPulser < 0) sparkDegFromPulser = 0;
+  uint32_t sparkDelayUs = (uint32_t)(((uint64_t)sparkDegFromPulser * predicted_interval) / 3600ULL);
+  
+  if (sparkDelayUs >= predicted_interval) {
+    TCI_COIL_SPARK(); 
+    return;
+  }
+
+  uint32_t finalChargeDelayUs;
+  uint32_t finalDwellUs;
+
+  if (sparkDelayUs > targetDwellUs) {
+    finalChargeDelayUs = sparkDelayUs - targetDwellUs;
+    finalDwellUs = targetDwellUs;
+  } else {
+    finalChargeDelayUs = 5; 
+    finalDwellUs = (sparkDelayUs > 10) ? (sparkDelayUs - 5) : 5;
+  }
+
+  dwellUsGlobal = finalDwellUs; 
+  fast_set_gptimer_alarm(timerDelay, finalChargeDelayUs);
 }
 
 long mapRange(long x, long in_min, long in_max, long out_min, long out_max) {
@@ -490,11 +420,9 @@ long mapRange(long x, long in_min, long in_max, long out_min, long out_max) {
 
 void codeTaskSensor(void * parameter) {
   esp_task_wdt_add(NULL); 
-  
-  // Variabel untuk Filter Dinamis
-  static float emaTpsFloat = 0; 
-  static uint32_t emaBatt = 0, emaTemp = 0;
+  static uint32_t emaTpsInt = 0, emaBatt = 0, emaTemp = 0;
   static uint8_t faultCounter = 0;
+  static bool dtc_logged = false;
   
   for(;;) {
     esp_task_wdt_reset(); 
@@ -503,9 +431,7 @@ void codeTaskSensor(void * parameter) {
     int mvTps = 0, mvBatt = 0, mvTemp = 0;
 
     adc_oneshot_read(adc1_handle, ADC_CHAN_TPS, &rawTps);
-    esp_rom_delay_us(100);
     adc_oneshot_read(adc1_handle, ADC_CHAN_BATT, &rawBatt);
-    esp_rom_delay_us(100);
     adc_oneshot_read(adc1_handle, ADC_CHAN_TEMP, &rawTemp);
 
     if (adc1_cali_handle) {
@@ -523,18 +449,21 @@ void codeTaskSensor(void * parameter) {
       if (faultCounter > 0) faultCounter--;
     }
     bool isFaulty = (faultCounter >= 10);
-    
-    // PERBAIKAN LOGIKA: Filter TPS Dinamis (Anti-Lag)
-    if (emaTpsFloat == 0) emaTpsFloat = (float)mvTps;
-    float deltaTps = fabs((float)mvTps - emaTpsFloat);
-    float alphaTps = (deltaTps > 300.0) ? 0.8 : ((deltaTps > 100.0) ? 0.3 : 0.1); // Deteksi pergerakan gas instan
-    emaTpsFloat = (alphaTps * (float)mvTps) + ((1.0 - alphaTps) * emaTpsFloat);
-    
-    emaBatt = (emaBatt == 0) ? (mvBatt << 2) : (emaBatt - (emaBatt >> 2) + mvBatt);
-    emaTemp = (emaTemp == 0) ? (mvTemp << 2) : (emaTemp - (emaTemp >> 2) + mvTemp);
 
-    uint16_t cT = (uint16_t)emaTpsFloat;
-    uint16_t cB = emaBatt >> 2, cTemp = emaTemp >> 2;
+    if (isFaulty && !dtc_logged) {
+      logDTC("P0122_SENSOR_MULTIPLE_FAULT");
+      dtc_logged = true;
+    } else if (!isFaulty && dtc_logged) {
+      dtc_logged = false; 
+    }
+    
+    emaTpsInt = (emaTpsInt == 0) ? (mvTps << 2) : (emaTpsInt - (emaTpsInt >> 2) + mvTps);
+    emaBatt   = (emaBatt == 0)   ? (mvBatt << 2) : (emaBatt - (emaBatt >> 2) + mvBatt);
+    emaTemp   = (emaTemp == 0)   ? (mvTemp << 2) : (emaTemp - (emaTemp >> 2) + mvTemp);
+
+    uint16_t cT    = emaTpsInt >> 2;
+    uint16_t cB    = emaBatt >> 2;
+    uint16_t cTemp = emaTemp >> 2;
 
     uint8_t tpsP    = (uint8_t)mapRange(cT, 450, 2800, 0, 100); 
     uint16_t battV  = (uint16_t)mapRange(cB, 0, 3100, 0, 160);
@@ -545,6 +474,12 @@ void codeTaskSensor(void * parameter) {
     currentBatteryVoltage10 = battV; 
     currentEngineTemp10 = tempC; 
     sensorFaultStatus = isFaulty; 
+    
+    uint64_t now = esp_timer_get_time();
+    if ((now - last_pulse_time) > 200000ULL && currentRPM != 0) {
+        currentRPM = 0;
+        currentEngineState = STATE_STOPPED;
+    }
     portEXIT_CRITICAL(&isrMux);
     
     vTaskDelay(pdMS_TO_TICKS(10)); 
@@ -589,7 +524,6 @@ void codeTaskTelemetry(void * parameter) {
     esp_task_wdt_reset();
     TelemetryData pkt;
     
-    // Pengambilan data dilakukan secara lock-free (sangat cepat, tidak memblokir Core 1)
     portENTER_CRITICAL(&isrMux);
     pkt.header = 0xAA55; 
     pkt.rpm = currentRPM; 
@@ -603,10 +537,8 @@ void codeTaskTelemetry(void * parameter) {
     portEXIT_CRITICAL(&isrMux);
 
     pkt.crc16 = calculateCRC16((uint8_t*)&pkt, sizeof(TelemetryData) - sizeof(uint16_t));
-    
-    // UART Buffer Write (Berada di Core 0 Priority Rendah, dijamin aman dari ISR Pengapian)
     uart_write_bytes(UART_NUM_2, (const char*)&pkt, sizeof(TelemetryData));
-    vTaskDelay(pdMS_TO_TICKS(40)); // Pengiriman dibatasi 25 FPS untuk stabilitas ESP32-C3
+    vTaskDelay(pdMS_TO_TICKS(40)); 
   }
 }
 
@@ -625,11 +557,11 @@ void codeTaskCommandListener(void * parameter) {
         cmdIdx = 0; 
         CommandData *cmd = (CommandData*)cmdBuf;
         if (cmd->crc16 == calculateCRC16(cmdBuf, sizeof(CommandData) - sizeof(uint16_t))) {
-          portENTER_CRITICAL(&isrMux);
-          if (currentEngineState == STATE_STOPPED && cmd->requestedMode <= MODE_CUSTOM) {
+          if (isEngineStopped() && cmd->requestedMode <= MODE_CUSTOM) {
+            portENTER_CRITICAL(&isrMux);
             currentMode = (ModePengapian)cmd->requestedMode;
+            portEXIT_CRITICAL(&isrMux);
           }
-          portEXIT_CRITICAL(&isrMux);
         }
       }
     }
@@ -638,10 +570,139 @@ void codeTaskCommandListener(void * parameter) {
 }
 
 // -----------------------------------------------------------------------------
-// WI-FI & WEBSERVER
+// WEBSERVER HANDLERS WITH STATIC MEMORY
 // -----------------------------------------------------------------------------
+
 esp_err_t root_get_handler(httpd_req_t *req) {
-  httpd_resp_send(req, "TCI Satria FU Dashboard Ready", HTTPD_RESP_USE_STRLEN); 
+  httpd_resp_set_type(req, "text/html");
+  // Pastikan Anda menempelkan source HTML Web UI Anda di baris ini
+  httpd_resp_send_chunk(req, "<!DOCTYPE html><html><head>... (Potongan HTML Web UI) ... </html>", HTTPD_RESP_USE_STRLEN);
+  httpd_resp_send_chunk(req, NULL, 0); 
+  return ESP_OK;
+}
+
+esp_err_t data_get_handler(httpd_req_t *req) {
+  char json_resp[128];
+  portENTER_CRITICAL(&isrMux);
+  uint16_t r = currentRPM;
+  uint8_t  t = currentTPS;
+  int16_t  temp = currentEngineTemp10;
+  uint16_t b = currentBatteryVoltage10;
+  portEXIT_CRITICAL(&isrMux);
+
+  snprintf(json_resp, sizeof(json_resp), "{\"rpm\":%d,\"tps\":%d,\"temp\":%d,\"batt\":%d}", r, t, temp, b);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_resp, HTTPD_RESP_USE_STRLEN);
+  return ESP_OK;
+}
+
+esp_err_t setmode_get_handler(httpd_req_t *req) {
+  if (!isEngineStopped()) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "GAGAL: Mesin harus mati untuk mengubah mode!");
+    return ESP_OK;
+  }
+  char buf[64];
+  if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
+    char tokenParam[32];
+    if (httpd_query_key_value(buf, "token", tokenParam, sizeof(tokenParam)) != ESP_OK || strcmp(tokenParam, API_SECRET_TOKEN) != 0) {
+      httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "AKSES DITOLAK: Token Keamanan Tidak Valid!");
+      return ESP_OK;
+    }
+    char param[16];
+    if (httpd_query_key_value(buf, "mode", param, sizeof(param)) == ESP_OK) {
+      int m = atoi(param);
+      portENTER_CRITICAL(&isrMux);
+      if (m <= MODE_CUSTOM) currentMode = (ModePengapian)m;
+      portEXIT_CRITICAL(&isrMux);
+    }
+  }
+  const char* modeStr[] = {"Mode Daily Aktif", "Mode Racing Aktif", "Mode Extreme Aktif", "Mode Custom Aktif"};
+  uint8_t mIdx = currentMode;
+  if (mIdx > 3) mIdx = 0;
+  httpd_resp_send(req, modeStr[mIdx], HTTPD_RESP_USE_STRLEN);
+  return ESP_OK;
+}
+
+esp_err_t getmap_get_handler(httpd_req_t *req) {
+  char buf[32];
+  int idx = 0;
+  if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
+    char param[16];
+    if (httpd_query_key_value(buf, "idx", param, sizeof(param)) == ESP_OK) {
+      idx = atoi(param);
+      if (idx >= MAX_CUSTOM_SLOTS) idx = 0;
+    }
+  }
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send_chunk(req, "[", 1);
+  char cellBuf[32];
+  for (int r = 0; r < NUM_RPM_POINTS; r++) {
+    httpd_resp_send_chunk(req, "[", 1);
+    for (int c = 0; c < NUM_TPS_POINTS; c++) {
+      snprintf(cellBuf, sizeof(cellBuf), "%d%s", mapCustomSlots[idx][r][c], (c < NUM_TPS_POINTS - 1) ? "," : "");
+      httpd_resp_send_chunk(req, cellBuf, HTTPD_RESP_USE_STRLEN);
+    }
+    snprintf(cellBuf, sizeof(cellBuf), "]%s", (r < NUM_RPM_POINTS - 1) ? "," : "");
+    httpd_resp_send_chunk(req, cellBuf, HTTPD_RESP_USE_STRLEN);
+  }
+  httpd_resp_send_chunk(req, "]", 1);
+  httpd_resp_send_chunk(req, NULL, 0);
+  return ESP_OK;
+}
+
+esp_err_t savemap_post_handler(httpd_req_t *req) {
+  if (!isEngineStopped()) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "AKSES DITOLAK: Mesin harus mati untuk menyimpan Map!");
+    return ESP_OK;
+  }
+
+  portENTER_CRITICAL(&webMux);
+  memset(web_post_buffer, 0, sizeof(web_post_buffer));
+
+  int ret = httpd_req_recv(req, web_post_buffer, sizeof(web_post_buffer) - 1);
+  if (ret <= 0) {
+    portEXIT_CRITICAL(&webMux);
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+  
+  char tokenVal[32];
+  if (httpd_query_key_value(web_post_buffer, "token", tokenVal, sizeof(tokenVal)) != ESP_OK || strcmp(tokenVal, API_SECRET_TOKEN) != 0) {
+    portEXIT_CRITICAL(&webMux);
+    httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "AKSES DITOLAK: Token Keamanan Tidak Valid!");
+    return ESP_OK;
+  }
+
+  int idx = 0;
+  char valStr[16];
+  if (httpd_query_key_value(web_post_buffer, "idx", valStr, sizeof(valStr)) == ESP_OK) {
+    idx = atoi(valStr);
+    if (idx >= MAX_CUSTOM_SLOTS) idx = 0;
+  }
+  
+  char key[16];
+  for (int r = 0; r < NUM_RPM_POINTS; r++) {
+    for (int c = 0; c < NUM_TPS_POINTS; c++) {
+      snprintf(key, sizeof(key), "v_%d_%d", r, c);
+      if (httpd_query_key_value(web_post_buffer, key, valStr, sizeof(valStr)) == ESP_OK) {
+        if (strlen(valStr) > 0) {
+          char *endptr;
+          long parsed = strtol(valStr, &endptr, 10);
+          if (*endptr == '\0') {
+            if (parsed < 0) parsed = 0;
+            if (parsed > ROTOR_PULSER_DEGREES_10) parsed = ROTOR_PULSER_DEGREES_10;
+            mapCustomSlots[idx][r][c] = (int16_t)parsed;
+          }
+        }
+      }
+    }
+  }
+  portEXIT_CRITICAL(&webMux);
+
+  updateActiveMapBuffer();
+  saveCustomMapToNVS(idx);
+
+  httpd_resp_send(req, "Map Berhasil Disimpan ke NVS Flash!", HTTPD_RESP_USE_STRLEN);
   return ESP_OK;
 }
 
@@ -649,12 +710,25 @@ void setWirelessState(bool enable) {
   portENTER_CRITICAL(&isrMux); 
   wirelessActive = enable; 
   portEXIT_CRITICAL(&isrMux);
+  
   if (enable) {
     esp_wifi_start();
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.stack_size = 8192;
+    config.max_uri_handlers = 10;
+    
     if (server == NULL && httpd_start(&server, &config) == ESP_OK) {
       httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = NULL };
+      httpd_uri_t data_uri = { .uri = "/data", .method = HTTP_GET, .handler = data_get_handler, .user_ctx = NULL };
+      httpd_uri_t setmode_uri = { .uri = "/setmode", .method = HTTP_GET, .handler = setmode_get_handler, .user_ctx = NULL };
+      httpd_uri_t getmap_uri = { .uri = "/getmap", .method = HTTP_GET, .handler = getmap_get_handler, .user_ctx = NULL };
+      httpd_uri_t savemap_uri = { .uri = "/savemap", .method = HTTP_POST, .handler = savemap_post_handler, .user_ctx = NULL };
+
       httpd_register_uri_handler(server, &root);
+      httpd_register_uri_handler(server, &data_uri);
+      httpd_register_uri_handler(server, &setmode_uri);
+      httpd_register_uri_handler(server, &getmap_uri);
+      httpd_register_uri_handler(server, &savemap_uri);
     }
   } else {
     if (server) { 
@@ -667,46 +741,35 @@ void setWirelessState(bool enable) {
 
 void codeTaskNetwork(void * parameter) {
   esp_task_wdt_add(NULL);
-  setWirelessState(true);
+  
+  setWirelessState(false);
   uint32_t lastModeBtn = 0, lastWifiBtn = 0;
   
   for (;;) {
     esp_task_wdt_reset(); 
-    EngineState st; 
-    bool stateW;
-    portENTER_CRITICAL(&isrMux); 
-    st = currentEngineState; 
-    stateW = wirelessActive; 
-    portEXIT_CRITICAL(&isrMux);
-    
-    if ((st == STATE_CRANKING || st == STATE_RUNNING) && stateW) {
-      setWirelessState(false);
-    }
-    
     uint32_t now = esp_timer_get_time() / 1000;
+    
     if (gpio_get_level(PIN_BUTTON) == 0 && (now - lastModeBtn > 300)) {
-      portENTER_CRITICAL(&isrMux);
-      if (currentEngineState == STATE_STOPPED) {
+      if (isEngineStopped()) {
+        portENTER_CRITICAL(&isrMux);
         currentMode = (ModePengapian)((currentMode + 1) % 4); 
+        portEXIT_CRITICAL(&isrMux); 
       }
-      portEXIT_CRITICAL(&isrMux); 
       lastModeBtn = now;
     }
+    
     if (gpio_get_level(PIN_BTN_WIFI) == 0 && (now - lastWifiBtn > 300)) {
       portENTER_CRITICAL(&isrMux); 
-      bool nState = !wirelessActive; 
-      if (currentEngineState != STATE_STOPPED) nState = false; 
+      bool nextWifiState = !wirelessActive; 
       portEXIT_CRITICAL(&isrMux); 
-      setWirelessState(nState); 
+      
+      setWirelessState(nextWifiState); 
       lastWifiBtn = now;
     }
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
 
-// -----------------------------------------------------------------------------
-// SETUP UTAMA ESP-IDF (app_main)
-// -----------------------------------------------------------------------------
 void app_main(void) {
   esp_task_wdt_config_t twdt_config = { 
     .timeout_ms = WDT_TIMEOUT_SECONDS * 1000, 
@@ -714,6 +777,7 @@ void app_main(void) {
     .trigger_panic = true 
   };
   esp_task_wdt_init(&twdt_config);
+  esp_task_wdt_add(NULL);
 
   gpio_config_t io_out = {
     .pin_bit_mask = (1ULL << PIN_TCI),
@@ -769,8 +833,6 @@ void app_main(void) {
   };
   uart_param_config(UART_NUM_2, &uart_cfg); 
   uart_set_pin(UART_NUM_2, PIN_TX_TELEMETRY, PIN_RX_TELEMETRY, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-  
-  // PERBAIKAN: Meningkatkan ukuran buffer TX UART untuk mencegah internal blocking jika penerima lambat
   uart_driver_install(UART_NUM_2, 512, 512, 0, NULL, 0);
 
   adc_oneshot_unit_init_cfg_t init_config1 = { .unit_id = ADC_UNIT_1 }; 
@@ -831,13 +893,12 @@ void app_main(void) {
   
   loadCustomMap();
 
-  // Konfigurasi Multicore sudah tepat: Sensor dan Telemetri di Core 0, Pengapian di Core 1
   xTaskCreatePinnedToCore(codeTaskNetwork, "TaskNet", 4096, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(codeTaskSensor, "TaskSens", 3072, NULL, 5, NULL, 0);
-  xTaskCreatePinnedToCore(codeTaskIgnition, "TaskIgn", 4096, NULL, 24, &TaskIgnitionHandle, 1);
   xTaskCreatePinnedToCore(codeTaskTelemetry, "TaskTel", 2048, NULL, 3, NULL, 0);
   xTaskCreatePinnedToCore(codeTaskCommandListener, "TaskCmd", 2048, NULL, 2, NULL, 0);
-  xTaskCreatePinnedToCore(codeTaskTachOutput, "TaskTach", 2048, NULL, 2, NULL, 0);
+  
+  xTaskCreatePinnedToCore(codeTaskSensor, "TaskSens", 3072, NULL, 5, NULL, 1);
+  xTaskCreatePinnedToCore(codeTaskTachOutput, "TaskTach", 2048, NULL, 2, NULL, 1);
   
   gpio_config_t io_puls = { 
     .pin_bit_mask = (1ULL << PIN_PULSER), 
@@ -847,6 +908,7 @@ void app_main(void) {
     .intr_type = GPIO_INTR_NEGEDGE 
   };
   gpio_config(&io_puls); 
-  gpio_install_isr_service(0); 
+
+  gpio_install_isr_service(ESP_INTR_FLAG_IRAM); 
   gpio_isr_handler_add(PIN_PULSER, pulserISR, NULL);
 }
