@@ -808,7 +808,7 @@ void app_main(void) {
 
   // Init Wi-Fi SoftAP
   esp_netif_init(); 
-  esp_event_loop_createdefault(); 
+  esp_event_loop_create_default(); // TYPO DIPERBAIKI DI SINI
   esp_netif_create_default_wifi_ap();
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT(); 
   esp_wifi_init(&cfg);
