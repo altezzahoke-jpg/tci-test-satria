@@ -1,3 +1,3 @@
-idf_component_register(SRCS "main.c"
-                    INCLUDE_DIRS "."
-                    PRIV_REQUIRES app_update nvs_flash esp_wifi esp_http_server driver esp_adc)
+cmake_minimum_required(VERSION 3.16)
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(tci_esp32_pro)
