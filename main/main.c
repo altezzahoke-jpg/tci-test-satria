@@ -1,5 +1,5 @@
 /* ==============================================================================
- * FIRMWARE ECU TCI SATRIA FU KARBURATOR (ESP32-S3)
+ * FIRMWARE ECU TCI SATRIA FU KARBURATOR (ESP32-S3) - FIXED VERSION
  * LEVEL: OEM / AUTOMOTIVE GRADE (90%-95% Compliant)
  * Features: Zero Dynamic Memory, 100% Static RTOS Tasks, MISRA-C Safe Parser, 
  *           Atomic Lock-Free Variables, Hardware Timer Ignition.
@@ -12,6 +12,7 @@
 #include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "driver/gptimer.h"
@@ -54,7 +55,8 @@
 #define ADC_CHAN_BATT    ADC_CHANNEL_1 
 #define ADC_CHAN_TEMP    ADC_CHANNEL_2 
 
-#define WDT_TIMEOUT_MS 150
+// Perbaikan: WDT Timeout diperbesar ke 1000ms untuk mencegah crash saat operasi WiFi/NVS
+#define WDT_TIMEOUT_MS 1000
 #define AP_SSID "TCI_SatriaFU_Pro"
 #define AP_PASS "12345678" 
 #define API_SECRET_TOKEN "satria123"
@@ -184,6 +186,25 @@ DRAM_ATTR int16_t mapCustomSlots[MAX_CUSTOM_SLOTS][NUM_RPM_POINTS][NUM_TPS_POINT
 DRAM_ATTR int16_t activeCustomMapBuffer[2][NUM_RPM_POINTS][NUM_TPS_POINTS];
 
 static char web_buffer[4096];
+// Perbaikan Thread-Safety: Mutex statis untuk mengunci web_buffer
+static SemaphoreHandle_t web_buf_mutex = NULL;
+static StaticSemaphore_t web_buf_mutex_buffer;
+
+// -----------------------------------------------------------------------------
+// HELPER: FALLBACK NON-LINEAR ADC CONVERSION
+// -----------------------------------------------------------------------------
+static int32_t adc_raw_to_mv_fallback(int raw) {
+    if (raw <= 0) return 0;
+    if (raw >= 4095) return 3300;
+    // Approximasi kurva non-linier terarah untuk ADC ESP32-S3 (12-bit)
+    int32_t mv = (raw * 3300) / 4095;
+    if (raw < 200) {
+        mv = (raw * 160) / 200; // Koreksi offset batas bawah
+    } else if (raw > 3800) {
+        mv = 3060 + ((raw - 3800) * 240) / 295; // Koreksi kompresi batas atas
+    }
+    return mv;
+}
 
 // -----------------------------------------------------------------------------
 // MISRA-C COMPLIANT STRING PARSER (MENGGANTIKAN ATOI & STRTOL)
@@ -483,15 +504,15 @@ void codeTaskSensor(void * parameter) {
 
     adc_oneshot_read(adc1_handle, ADC_CHAN_TPS, &rawTps);
     if (adc1_cali_handle) adc_cali_raw_to_voltage(adc1_cali_handle, rawTps, &mvTps);
-    else mvTps = (rawTps * 3300) / 4095;
+    else mvTps = adc_raw_to_mv_fallback(rawTps);
 
     adc_oneshot_read(adc1_handle, ADC_CHAN_BATT, &rawBatt);
     if (adc1_cali_handle) adc_cali_raw_to_voltage(adc1_cali_handle, rawBatt, &mvBatt);
-    else mvBatt = (rawBatt * 3300) / 4095; 
+    else mvBatt = adc_raw_to_mv_fallback(rawBatt); 
 
     adc_oneshot_read(adc1_handle, ADC_CHAN_TEMP, &rawTemp);
     if (adc1_cali_handle) adc_cali_raw_to_voltage(adc1_cali_handle, rawTemp, &mvTemp);
-    else mvTemp = (rawTemp * 3300) / 4095;
+    else mvTemp = adc_raw_to_mv_fallback(rawTemp);
 
     bool rawFault = (rawBatt < 100 || rawBatt > 4050 || rawTps > 4050 || rawTemp < 50 || rawTemp > 4050);
     if (rawFault) {
@@ -645,9 +666,16 @@ esp_err_t savemap_post_handler(httpd_req_t *req) {
     return ESP_OK;
   }
 
+  // Perbaikan Thread-Safety: Ambil lock mutex sebelum menyentuh web_buffer global
+  if (web_buf_mutex != NULL && xSemaphoreTake(web_buf_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Server Busy");
+      return ESP_FAIL;
+  }
+
   int total_len = req->content_len;
   if (total_len <= 0 || total_len >= sizeof(web_buffer)) {
       httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Payload Invalid or Too Large");
+      if (web_buf_mutex != NULL) xSemaphoreGive(web_buf_mutex);
       return ESP_FAIL;
   }
 
@@ -656,6 +684,7 @@ esp_err_t savemap_post_handler(httpd_req_t *req) {
       int received = httpd_req_recv(req, web_buffer + cur_len, total_len - cur_len);
       if (received <= 0) {
           if (received == HTTPD_SOCK_ERR_TIMEOUT) continue;
+          if (web_buf_mutex != NULL) xSemaphoreGive(web_buf_mutex);
           return ESP_FAIL;
       }
       cur_len += received;
@@ -665,6 +694,7 @@ esp_err_t savemap_post_handler(httpd_req_t *req) {
   char tokenVal[32];
   if (httpd_query_key_value(web_buffer, "token", tokenVal, sizeof(tokenVal)) != ESP_OK || strcmp(tokenVal, API_SECRET_TOKEN) != 0) {
     httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Token Tidak Valid!");
+    if (web_buf_mutex != NULL) xSemaphoreGive(web_buf_mutex);
     return ESP_OK;
   }
 
@@ -703,6 +733,9 @@ esp_err_t savemap_post_handler(httpd_req_t *req) {
   memcpy(mapCustomSlots[idx], tempMap, sizeof(tempMap));
   updateActiveMapBuffer();
   saveCustomMapToNVS(idx);
+
+  // Lepaskan lock mutex
+  if (web_buf_mutex != NULL) xSemaphoreGive(web_buf_mutex);
 
   httpd_resp_send(req, "Map Berhasil Disimpan", HTTPD_RESP_USE_STRLEN);
   return ESP_OK;
@@ -811,7 +844,12 @@ void codeTaskCommandListener(void * parameter) {
           continue;
       }
       
-      cmdBuf[cmdIdx++] = c;
+      if (cmdIdx < sizeof(CommandData)) {
+          cmdBuf[cmdIdx++] = c;
+      } else {
+          cmdIdx = 0; // Boundary Protection
+      }
+
       if (cmdIdx >= sizeof(CommandData)) {
         cmdIdx = 0; 
         CommandData *cmd = (CommandData*)cmdBuf;
@@ -829,13 +867,14 @@ void codeTaskCommandListener(void * parameter) {
 // -----------------------------------------------------------------------------
 // DEKLARASI MEMORI STATIS UNTUK RTOS TASKS (ZERO DYNAMIC ALLOCATION)
 // -----------------------------------------------------------------------------
-#define STACK_SIZE_IGN   3072
+// Perbaikan: Penyesuaian ukuran stack static untuk stabilitas eksekusi
+#define STACK_SIZE_IGN   4096
 #define STACK_SIZE_SENS  4096
 #define STACK_SIZE_TACH  2048
 #define STACK_SIZE_SCRUB 2048
 #define STACK_SIZE_NET   4096
-#define STACK_SIZE_TEL   2048
-#define STACK_SIZE_CMD   2048
+#define STACK_SIZE_TEL   3072
+#define STACK_SIZE_CMD   3072
 
 static StackType_t ignTaskStack[STACK_SIZE_IGN];
 static StaticTask_t ignTaskBuffer;
@@ -863,6 +902,9 @@ static StaticTask_t cmdTaskBuffer;
 // -----------------------------------------------------------------------------
 void app_main(void) {
   esp_ota_mark_app_valid_cancel_rollback(); 
+
+  // Inisialisasi Mutex Statis untuk Web Buffer
+  web_buf_mutex = xSemaphoreCreateMutexStatic(&web_buf_mutex_buffer);
 
   SecureData_Write(&sec_mode, (uint32_t)MODE_DAILY);
   SecureData_Write(&sec_engine_state, (uint32_t)STATE_STOPPED);
