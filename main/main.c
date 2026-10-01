@@ -1,6 +1,6 @@
 /* ==============================================================================
  * FIRMWARE ECU TCI SATRIA FU KARBURATOR (ESP32-S3) - DEDICATED ECU ENGINE NODE
- * LEVEL: OEM / AUTOMOTIVE GRADE (90%-95% Compliant)
+ * LEVEL: OEM / AUTOMOTIVE GRADE (REVISI KEAMANAN & REAL-TIME)
  * ============================================================================== */
 
 #include <stdio.h>
@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "driver/gptimer.h"
@@ -59,6 +60,7 @@ typedef enum { IGN_IDLE = 0, IGN_WAITING_CHARGE, IGN_WAITING_SPARK } IgnitionSeq
 // RAM MEMORY SCRUBBING & E2E DATA PROTECTION (ISO 26262 ASIL-B)
 // -----------------------------------------------------------------------------
 portMUX_TYPE secure_mux = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE ign_mux = portMUX_INITIALIZER_UNLOCKED; // Spinlock khusus ISR Pengapian
 
 typedef struct {
     uint32_t data;
@@ -104,10 +106,7 @@ _Atomic uint8_t lastAckStatus = 0;
 
 _Atomic uint32_t pulse_interval_us = 0;
 _Atomic uint32_t last_pulse_time_us = 0;
-_Atomic int16_t cachedAdv10 = 100;
-_Atomic uint32_t cachedDwellUs = 3200;
 
-// Penyimpanan nilai Custom saat ini yang aktif dipakai mesin
 _Atomic uint16_t activeCustomRpmLimit = 12500;
 _Atomic uint32_t activeCustomDwell = 3200;
 
@@ -115,10 +114,10 @@ volatile IgnitionSequenceState ignState = IGN_IDLE;
 volatile uint64_t target_spark_count = 0;
 volatile JenisBBM currentFuel = BBM_PERTALITE;
 
-TaskHandle_t ignCalcTaskHandle = NULL; 
 gptimer_handle_t timerIgnition = NULL; 
 adc_oneshot_unit_handle_t adc1_handle;
 adc_cali_handle_t adc1_cali_handle = NULL;
+QueueHandle_t uart2_queue; // Queue untuk efisiensi Event UART
 
 #define NUM_RPM_POINTS 15
 #define NUM_TPS_POINTS 5
@@ -139,7 +138,6 @@ typedef struct {
   uint16_t crc16;      
 } TelemetryData;
 
-// STRUKTUR PAKET DIPERBARUI SESUAI C3 (Ada rpmLimit & dwellUs)
 typedef struct {
   uint16_t header;       
   uint8_t  cmdType;      
@@ -208,9 +206,9 @@ static inline bool isEngineStopped(void) {
   return false;
 }
 
-long mapRange(long x, long in_min, long in_max, long out_min, long out_max) {
+static inline int32_t IRAM_ATTR mapRange(int32_t x, int32_t in_min, int32_t in_max, int32_t out_min, int32_t out_max) {
   if (in_max == in_min) return out_min;
-  long result = (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+  int32_t result = (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
   if (result < out_min) result = out_min;
   if (result > out_max) result = out_max;
   return result;
@@ -232,9 +230,12 @@ void updateActiveMapBuffer(void) {
   uint8_t slot = atomic_load(&currentCustomSlot);
   if (slot >= MAX_CUSTOM_SLOTS) slot = 0;
   uint8_t nextBuf = 1 - atomic_load(&activeMapIndex);
+  
   memcpy(activeCustomMapBuffer[nextBuf], mapCustomSlots[slot], sizeof(activeCustomMapBuffer[0]));
   
-  // Update parameter custom yang aktif di memori atomik
+  // Sinkronisasi Memori / Memory Barrier agar Map terbaca utuh oleh ISR
+  atomic_thread_fence(memory_order_release);
+  
   atomic_store(&activeCustomRpmLimit, rpmLimitCustomSlots[slot]);
   atomic_store(&activeCustomDwell, dwellCustomSlots[slot]);
   atomic_store(&activeMapIndex, nextBuf);
@@ -250,17 +251,16 @@ void initDefaultRAMMaps(void) {
 }
 
 // -----------------------------------------------------------------------------
-// HARDWARE ABSTRACTION LAYER (HAL) PURE LOGIC
+// HARDWARE ABSTRACTION LAYER (HAL) PURE LOGIC - DIPINDAH KE IRAM
 // -----------------------------------------------------------------------------
 typedef struct {
     int16_t finalAdvance10;
     uint32_t finalDwellUs;
 } IgnitionCommand_t;
 
-IgnitionCommand_t HAL_IgnitionLogic_Calculate(uint16_t rpm, uint8_t tps, int16_t temp10, uint16_t batt10, ModePengapian mode, EngineState state, bool fault) {
+static inline IgnitionCommand_t IRAM_ATTR HAL_IgnitionLogic_Calculate(uint16_t rpm, uint8_t tps, int16_t temp10, uint16_t batt10, ModePengapian mode, EngineState state, bool fault) {
     IgnitionCommand_t cmd;
     
-    // PEMBARUAN: Kalkulasi Dwell disesuaikan Mode
     if (mode == MODE_CUSTOM) {
         cmd.finalDwellUs = atomic_load(&activeCustomDwell);
     } else {
@@ -301,6 +301,7 @@ IgnitionCommand_t HAL_IgnitionLogic_Calculate(uint16_t rpm, uint8_t tps, int16_t
         q11 = mapExtreme3DBase[r0][t0]; q21 = mapExtreme3DBase[r1][t0]; 
         q12 = mapExtreme3DBase[r0][t1]; q22 = mapExtreme3DBase[r1][t1];
     } else {
+        atomic_thread_fence(memory_order_acquire); // Mencegah akses setengah matang saat update
         uint8_t bufIdx = atomic_load(&activeMapIndex);
         q11 = activeCustomMapBuffer[bufIdx][r0][t0]; q21 = activeCustomMapBuffer[bufIdx][r1][t0]; 
         q12 = activeCustomMapBuffer[bufIdx][r0][t1]; q22 = activeCustomMapBuffer[bufIdx][r1][t1];
@@ -321,7 +322,6 @@ IgnitionCommand_t HAL_IgnitionLogic_Calculate(uint16_t rpm, uint8_t tps, int16_t
     
     if (adv > ROTOR_PULSER_DEGREES_10) adv = ROTOR_PULSER_DEGREES_10;
     cmd.finalAdvance10 = adv;
-
     return cmd;
 }
 
@@ -329,15 +329,21 @@ IgnitionCommand_t HAL_IgnitionLogic_Calculate(uint16_t rpm, uint8_t tps, int16_t
 // HARDWARE INTERRUPTS & TIMERS
 // -----------------------------------------------------------------------------
 static bool IRAM_ATTR onIgnitionTimer(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx) {
+  portENTER_CRITICAL_ISR(&ign_mux); // Proteksi Spinlock
+  
   if (ignState == IGN_WAITING_CHARGE) {
     TCI_COIL_CHARGE();
     ignState = IGN_WAITING_SPARK;
+    
+    // Set alarm proteksi pemutus (Spark Hardware Cutoff)
     gptimer_alarm_config_t alarm_config = { .alarm_count = target_spark_count, .reload_count = 0, .flags.auto_reload_on_alarm = false };
     gptimer_set_alarm_action(timer, &alarm_config);
   } else if (ignState == IGN_WAITING_SPARK) {
     TCI_COIL_SPARK();
     ignState = IGN_IDLE;
   }
+  
+  portEXIT_CRITICAL_ISR(&ign_mux);
   return false;
 }
 
@@ -346,20 +352,13 @@ static void IRAM_ATTR pulserISR(void* arg) {
   uint32_t last_us = atomic_load(&last_pulse_time_us);
   uint32_t interval_us = now_us - last_us;
   
-  if (interval_us == 0) return;
+  if (interval_us < 2000) return; // Hard Debounce
 
   uint32_t expected_interval = atomic_load(&pulse_interval_us);
 
+  // Filter Noise RPM Ekstrim
   if (expected_interval > 0) {
-    if (interval_us < ((expected_interval * 4) / 10)) return; 
-    if (interval_us > (expected_interval * 3)) { 
-        if (ignState != IGN_IDLE) {
-            TCI_COIL_SPARK(); 
-            ignState = IGN_IDLE;
-        }
-    }
-  } else if (interval_us < 2000) {
-    return; 
+    if (interval_us < ((expected_interval * 6) / 10)) return; 
   }
 
   uint32_t rpm = 60000000UL / interval_us; 
@@ -370,21 +369,21 @@ static void IRAM_ATTR pulserISR(void* arg) {
   atomic_store(&currentRPM, (uint16_t)rpm);
   SecureData_Write(&sec_engine_state, (uint32_t)newState); 
 
-  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-  if (ignCalcTaskHandle != NULL) {
-      vTaskNotifyGiveFromISR(ignCalcTaskHandle, &xHigherPriorityTaskWoken);
-  }
+  // --- KALKULASI PENGAPIAN LANGSUNG DARI DALAM ISR (ZERO LATENCY) ---
+  uint32_t safeMode, safeState;
+  if (!SecureData_Read(&sec_mode, &safeMode)) safeMode = (uint32_t)MODE_DAILY;
+  if (!SecureData_Read(&sec_engine_state, &safeState)) safeState = (uint32_t)STATE_LIMP_HOME;
 
-  // PEMBARUAN: Limit RPM dinamis berdasarkan Mode
-  uint32_t safeMode;
-  uint16_t currentLimit = 12500;
-  uint16_t currentSoftLimit = 12300;
-  
-  if (SecureData_Read(&sec_mode, &safeMode) && safeMode == MODE_CUSTOM) {
-      currentLimit = atomic_load(&activeCustomRpmLimit);
-      if (currentLimit < 1000) currentLimit = 1000;
-      currentSoftLimit = currentLimit - 200;
-  }
+  uint8_t tps = atomic_load(&currentTPS);
+  int16_t temp = atomic_load(&currentEngineTemp10);
+  uint16_t batt = atomic_load(&currentBatteryVoltage10);
+  bool fault = atomic_load(&sensorFaultStatus);
+
+  IgnitionCommand_t cmd = HAL_IgnitionLogic_Calculate(rpm, tps, temp, batt, (ModePengapian)safeMode, (EngineState)safeState, fault);
+
+  uint16_t currentLimit = (safeMode == MODE_CUSTOM) ? atomic_load(&activeCustomRpmLimit) : 12500;
+  if (currentLimit < 1000) currentLimit = 1000;
+  uint16_t currentSoftLimit = currentLimit - 200;
 
   static uint8_t cut_counter = 0;
   if (newState == STATE_LIMP_HOME && rpm >= 6000) {
@@ -392,11 +391,11 @@ static void IRAM_ATTR pulserISR(void* arg) {
       if (cut_counter % 2 != 0) { TCI_COIL_SPARK(); return; }
   } else if (rpm >= currentLimit) { 
       cut_counter++;
-      if (cut_counter % 3 != 0) { TCI_COIL_SPARK(); return; }
+      if (cut_counter % 3 != 0) { TCI_COIL_SPARK(); ignState = IGN_IDLE; return; }
   }
 
-  int16_t adv10 = (rpm >= currentSoftLimit) ? 50 : atomic_load(&cachedAdv10);
-  uint32_t targetDwellUs = atomic_load(&cachedDwellUs);
+  int16_t adv10 = (rpm >= currentSoftLimit) ? 50 : cmd.finalAdvance10;
+  uint32_t targetDwellUs = cmd.finalDwellUs;
   atomic_store(&currentDegree10, adv10);
 
   uint32_t maxAllowedDwell = interval_us / 2;
@@ -406,6 +405,8 @@ static void IRAM_ATTR pulserISR(void* arg) {
   if (sparkDegFromPulser < 0) sparkDegFromPulser = 0;
   uint32_t sparkDelayUs = (sparkDegFromPulser * interval_us) / 3600;
 
+  portENTER_CRITICAL_ISR(&ign_mux); // Proteksi Spinlock ke State Machine
+
   if (sparkDelayUs >= interval_us) {
     TCI_COIL_SPARK(); 
     ignState = IGN_IDLE;
@@ -414,49 +415,24 @@ static void IRAM_ATTR pulserISR(void* arg) {
     gptimer_get_raw_count(timerIgnition, &current_count);
     uint64_t spark_count = current_count + sparkDelayUs;
     uint64_t charge_count = (sparkDelayUs > targetDwellUs) ? (spark_count - targetDwellUs) : (current_count + 5);
+    
     target_spark_count = spark_count;
     ignState = IGN_WAITING_CHARGE;
+    
     gptimer_alarm_config_t alarm_config = { .alarm_count = charge_count, .reload_count = 0, .flags.auto_reload_on_alarm = false };
     gptimer_set_alarm_action(timerIgnition, &alarm_config);
   }
 
-  if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
+  portEXIT_CRITICAL_ISR(&ign_mux);
 }
 
 // -----------------------------------------------------------------------------
-// RTOS TASKS (CORE 1: KRITIKAL & SENSOR)
+// RTOS TASKS 
 // -----------------------------------------------------------------------------
-void codeTaskIgnitionCalc(void * parameter) {
-  esp_task_wdt_add(NULL);
-  for (;;) {
-    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10)); 
-    esp_task_wdt_reset();
-
-    uint16_t rpm = atomic_load(&currentRPM);
-    uint8_t tps = atomic_load(&currentTPS);
-    int16_t temp = atomic_load(&currentEngineTemp10);
-    uint16_t batt = atomic_load(&currentBatteryVoltage10);
-    bool fault = atomic_load(&sensorFaultStatus);
-
-    uint32_t safeMode, safeState;
-    if (!SecureData_Read(&sec_mode, &safeMode) || !SecureData_Read(&sec_engine_state, &safeState)) {
-        safeMode = (uint32_t)MODE_DAILY;
-        safeState = (uint32_t)STATE_LIMP_HOME;
-    }
-
-    IgnitionCommand_t cmd = HAL_IgnitionLogic_Calculate(rpm, tps, temp, batt, (ModePengapian)safeMode, (EngineState)safeState, fault);
-
-    atomic_store(&cachedAdv10, cmd.finalAdvance10);
-    atomic_store(&cachedDwellUs, cmd.finalDwellUs);
-  }
-}
-
 void codeTaskSensor(void * parameter) {
   esp_task_wdt_add(NULL); 
   static uint16_t emaTps = 0, emaBatt = 0, emaTemp = 0;
   static uint8_t faultCounter = 0;
-  static uint8_t lastValidTps = 0;
-  static int16_t lastValidTemp = 300;
   
   for(;;) {
     esp_task_wdt_reset(); 
@@ -490,15 +466,7 @@ void codeTaskSensor(void * parameter) {
     uint16_t battV = (uint16_t)mapRange(emaBatt, 0, 3100, 0, 160);
     int16_t tempC  = (int16_t)mapRange(emaTemp, 300, 2800, -200, 1500);
 
-    if (abs((int)tpsP - (int)lastValidTps) > 15) {
-        tpsP = (tpsP > lastValidTps) ? (lastValidTps + 15) : (lastValidTps - 15);
-    }
-    lastValidTps = tpsP;
-
-    if (abs(tempC - lastValidTemp) > 20) {
-        tempC = (tempC > lastValidTemp) ? (lastValidTemp + 20) : (lastValidTemp - 20);
-    }
-    lastValidTemp = tempC;
+    // Limitasi Agresif TPS dihapus demi respons WOT spontan
 
     atomic_store(&currentTPS, tpsP); 
     atomic_store(&currentBatteryVoltage10, battV); 
@@ -510,8 +478,12 @@ void codeTaskSensor(void * parameter) {
       atomic_store(&currentRPM, 0);
       SecureData_Write(&sec_engine_state, (uint32_t)STATE_STOPPED);
       atomic_store(&pulse_interval_us, 0);
+      
+      // Hardware Cutoff (Anti-Koil Hangus saat Stall)
+      portENTER_CRITICAL(&ign_mux);
       ignState = IGN_IDLE;
       TCI_COIL_SPARK(); 
+      portEXIT_CRITICAL(&ign_mux);
     }
     vTaskDelay(pdMS_TO_TICKS(10)); 
   }
@@ -543,9 +515,6 @@ void codeTaskTachOutput(void * parameter) {
   }
 }
 
-// -----------------------------------------------------------------------------
-// RTOS TASKS (CORE 0: SCRUBBER, TELEMETRI, & PARSER SERIAL UART)
-// -----------------------------------------------------------------------------
 void codeTaskMemoryScrubber(void * parameter) {
     for(;;) {
         uint32_t dummy;
@@ -611,81 +580,69 @@ void codeTaskTelemetry(void * parameter) {
 
 void codeTaskCommandListener(void * parameter) {
   esp_task_wdt_add(NULL);
+  uart_event_t event;
   static uint8_t packetBuf[sizeof(CommandPacket)]; 
-  static size_t rxIdx = 0;
+  size_t rxIdx = 0;
 
   for(;;) {
     esp_task_wdt_reset();
-    uint8_t c;
-    while (uart_read_bytes(UART_NUM_2, &c, 1, 0) > 0) {
-      if (rxIdx == 0) {
-        if (c == 0x55) packetBuf[rxIdx++] = c;
-        continue;
-      } else if (rxIdx == 1) {
-        if (c == 0xCC) {
-          packetBuf[rxIdx++] = c;
-        } else if (c == 0x55) {
-          rxIdx = 1;
-        } else {
-          rxIdx = 0;
-        }
-        continue;
-      }
+    // Komunikasi UART Berbasis Event Queue (Lebih Hemat CPU)
+    if (xQueueReceive(uart2_queue, (void *)&event, pdMS_TO_TICKS(50))) {
+        if (event.type == UART_DATA) {
+            uint8_t c;
+            while (uart_read_bytes(UART_NUM_2, &c, 1, 0) > 0) {
+              if (rxIdx == 0 && c == 0x55) packetBuf[rxIdx++] = c;
+              else if (rxIdx == 1) {
+                  if (c == 0xCC) packetBuf[rxIdx++] = c;
+                  else rxIdx = 0;
+              }
+              else if (rxIdx > 1 && rxIdx < sizeof(CommandPacket)) {
+                  packetBuf[rxIdx++] = c;
+                  if (rxIdx == sizeof(CommandPacket)) {
+                      CommandPacket *cmd = (CommandPacket*)packetBuf;
+                      uint16_t calcCrc = calculateCRC16(packetBuf, sizeof(CommandPacket) - sizeof(uint16_t));
 
-      if (rxIdx < sizeof(CommandPacket)) {
-        packetBuf[rxIdx++] = c;
-      }
-
-      if (rxIdx >= sizeof(CommandPacket)) {
-        CommandPacket *cmd = (CommandPacket*)packetBuf;
-        uint16_t calcCrc = calculateCRC16(packetBuf, sizeof(CommandPacket) - sizeof(uint16_t));
-
-        if (cmd->crc16 == calcCrc) {
-          atomic_store(&lastAckStatus, 1); 
-          
-          if (cmd->cmdType == 0x01) { 
-            if (cmd->slotOrMode <= MODE_CUSTOM) {
-              SecureData_Write(&sec_mode, (uint32_t)cmd->slotOrMode);
-            }
-          } 
-          else if (cmd->cmdType == 0x02) { 
-            if (isEngineStopped()) {
-              uint8_t slot = cmd->slotOrMode;
-              if (slot < MAX_CUSTOM_SLOTS) {
-                // PEMBARUAN: Simpan Map, Limit RPM, dan Dwell ke Slot
-                memcpy(mapCustomSlots[slot], cmd->mapData, sizeof(cmd->mapData));
-                rpmLimitCustomSlots[slot] = cmd->rpmLimit;
-                dwellCustomSlots[slot] = cmd->dwellUs;
-                
-                atomic_store(&currentCustomSlot, slot);
-                updateActiveMapBuffer();
+                      if (cmd->crc16 == calcCrc) {
+                          atomic_store(&lastAckStatus, 1);
+                          if (cmd->cmdType == 0x01 && cmd->slotOrMode <= MODE_CUSTOM) {
+                              SecureData_Write(&sec_mode, (uint32_t)cmd->slotOrMode);
+                          } 
+                          else if (cmd->cmdType == 0x02) { 
+                              if (isEngineStopped()) {
+                                  uint8_t slot = cmd->slotOrMode;
+                                  if (slot < MAX_CUSTOM_SLOTS) {
+                                      memcpy(mapCustomSlots[slot], cmd->mapData, sizeof(cmd->mapData));
+                                      rpmLimitCustomSlots[slot] = cmd->rpmLimit;
+                                      dwellCustomSlots[slot] = cmd->dwellUs;
+                                      atomic_store(&currentCustomSlot, slot);
+                                      updateActiveMapBuffer(); 
+                                  }
+                              }
+                          }
+                      } else {
+                          atomic_store(&lastAckStatus, 2);
+                      }
+                      rxIdx = 0; 
+                  }
               }
             }
-          }
         } else {
-          atomic_store(&lastAckStatus, 2); 
+            uart_flush_input(UART_NUM_2);
+            xQueueReset(uart2_queue);
         }
-
-        rxIdx = 0; 
-      }
     }
-    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
 // -----------------------------------------------------------------------------
 // DEKLARASI MEMORI STATIS UNTUK RTOS TASKS (ZERO DYNAMIC ALLOCATION)
 // -----------------------------------------------------------------------------
-#define STACK_SIZE_IGN   4096
 #define STACK_SIZE_SENS  4096
 #define STACK_SIZE_TACH  2048
 #define STACK_SIZE_SCRUB 2048
 #define STACK_SIZE_BTN   2048
 #define STACK_SIZE_TEL   3072
 #define STACK_SIZE_CMD   4096
-
-static StackType_t ignTaskStack[STACK_SIZE_IGN];
-static StaticTask_t ignTaskBuffer;
 
 static StackType_t sensTaskStack[STACK_SIZE_SENS];
 static StaticTask_t sensTaskBuffer;
@@ -729,7 +686,7 @@ void app_main(void) {
     .intr_type = GPIO_INTR_DISABLE
   };
   gpio_config(&io_out); 
-  TCI_COIL_SPARK(); 
+  TCI_COIL_SPARK(); // Default Off (Spark)
   
   gpio_config_t io_in = {
     .pin_bit_mask = (1ULL << PIN_BUTTON_MODE),
@@ -768,7 +725,7 @@ void app_main(void) {
   };
   uart_param_config(UART_NUM_2, &uart_cfg); 
   uart_set_pin(UART_NUM_2, PIN_TX_TELEMETRY, PIN_RX_TELEMETRY, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-  uart_driver_install(UART_NUM_2, 512, 512, 0, NULL, 0);
+  uart_driver_install(UART_NUM_2, 512, 512, 20, &uart2_queue, 0); // Diubah ke Event Queue
 
   adc_oneshot_unit_init_cfg_t init_config1 = { .unit_id = ADC_UNIT_1 }; 
   adc_oneshot_new_unit(&init_config1, &adc1_handle);
@@ -798,9 +755,7 @@ void app_main(void) {
 
   initDefaultRAMMaps();
 
-  ignCalcTaskHandle = xTaskCreateStaticPinnedToCore(
-      codeTaskIgnitionCalc, "TaskIgnCalc", STACK_SIZE_IGN, NULL, 20, 
-      ignTaskStack, &ignTaskBuffer, 1);
+  // Task IgnitionCalc dihapus (Eksekusi dipindah inline ke ISR)
 
   xTaskCreateStaticPinnedToCore(
       codeTaskSensor, "TaskSens", STACK_SIZE_SENS, NULL, 5, 
