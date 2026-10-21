@@ -33,21 +33,21 @@
 #endif
 
 // -----------------------------------------------------------------------------
-// KONFIGURASI HARDWARE ESP32-S3
+// KONFIGURASI HARDWARE ESP32-S3 (PEMETAAN PIN FINAL)
 // -----------------------------------------------------------------------------
-#define PIN_PULSER       GPIO_NUM_4
-#define PIN_TCI          GPIO_NUM_17
+#define PIN_PULSER       GPIO_NUM_10
+#define PIN_TCI          GPIO_NUM_4
 #define PIN_BUTTON_MODE  GPIO_NUM_6
-#define PIN_TX_TELEMETRY GPIO_NUM_16
-#define PIN_RX_TELEMETRY GPIO_NUM_15
-#define PIN_TACH_OUT     GPIO_NUM_8
+#define PIN_TX_TELEMETRY GPIO_NUM_13
+#define PIN_RX_TELEMETRY GPIO_NUM_12
+#define PIN_TACH_OUT     GPIO_NUM_42
 
 #define TCI_COIL_CHARGE() REG_WRITE(GPIO_OUT_W1TS_REG, (1UL << PIN_TCI)) 
 #define TCI_COIL_SPARK()  REG_WRITE(GPIO_OUT_W1TC_REG, (1UL << PIN_TCI)) 
 
-#define ADC_CHAN_TPS     ADC_CHANNEL_0 
-#define ADC_CHAN_BATT    ADC_CHANNEL_1 
-#define ADC_CHAN_TEMP    ADC_CHANNEL_2 
+#define ADC_CHAN_TPS     ADC_CHANNEL_0  // GPIO 1 (ADC1)
+#define ADC_CHAN_TEMP    ADC_CHANNEL_1  // GPIO 2 (ADC1)
+#define ADC_CHAN_BATT    ADC_CHANNEL_2  // GPIO 3 (ADC1)
 
 #define WDT_TIMEOUT_MS   1000
 #define NVS_NAMESPACE    "ecu_tci_cfg"
@@ -172,7 +172,22 @@ DRAM_ATTR const int16_t mapDaily3DBase[NUM_RPM_POINTS][NUM_TPS_POINTS] = {
   {310, 330, 350, 350, 350}, {300, 320, 340, 340, 340}, {280, 300, 320, 320, 320},
   {260, 280, 300, 300, 300}, {250, 250, 280, 280, 280}, {250, 250, 250, 250, 250}
 };
-// [Peta Racing dan Extreme dihilangkan dari contoh ini untuk penghematan ruang, asumsikan ada]
+
+DRAM_ATTR const int16_t mapRacing3DBase[NUM_RPM_POINTS][NUM_TPS_POINTS] = {
+  {110, 110, 110, 110, 110}, {120, 120, 125, 130, 130}, {160, 175, 190, 200, 210},
+  {210, 230, 250, 260, 270}, {250, 275, 290, 310, 320}, {280, 305, 330, 340, 350},
+  {310, 335, 360, 370, 370}, {330, 355, 380, 390, 390}, {340, 365, 390, 390, 390},
+  {340, 365, 390, 390, 390}, {330, 355, 380, 380, 380}, {310, 335, 360, 360, 360},
+  {290, 315, 340, 340, 340}, {270, 280, 310, 310, 310}, {260, 260, 280, 280, 280}
+};
+
+DRAM_ATTR const int16_t mapExtreme3DBase[NUM_RPM_POINTS][NUM_TPS_POINTS] = {
+  {120, 120, 120, 120, 120}, {130, 135, 140, 145, 150}, {180, 195, 210, 225, 240},
+  {230, 255, 280, 295, 310}, {280, 310, 330, 350, 360}, {310, 340, 370, 385, 400},
+  {340, 375, 400, 410, 410}, {360, 395, 420, 430, 430}, {370, 405, 430, 430, 430},
+  {370, 405, 430, 430, 430}, {360, 395, 420, 420, 420}, {340, 375, 400, 400, 400},
+  {320, 350, 380, 380, 380}, {300, 310, 340, 340, 340}, {280, 280, 300, 300, 300}
+};
 
 DRAM_ATTR int16_t mapCustomSlots[MAX_CUSTOM_SLOTS][NUM_RPM_POINTS][NUM_TPS_POINTS];
 DRAM_ATTR uint16_t rpmLimitCustomSlots[MAX_CUSTOM_SLOTS];
@@ -346,6 +361,12 @@ IgnitionCommand_t HAL_IgnitionLogic_Calculate(uint16_t rpm, uint8_t tps, int16_t
     if (mode == MODE_DAILY) {
         q11 = mapDaily3DBase[r0][t0]; q21 = mapDaily3DBase[r1][t0]; 
         q12 = mapDaily3DBase[r0][t1]; q22 = mapDaily3DBase[r1][t1];
+    } else if (mode == MODE_RACING) {
+        q11 = mapRacing3DBase[r0][t0]; q21 = mapRacing3DBase[r1][t0]; 
+        q12 = mapRacing3DBase[r0][t1]; q22 = mapRacing3DBase[r1][t1];
+    } else if (mode == MODE_EXTREME) {
+        q11 = mapExtreme3DBase[r0][t0]; q21 = mapExtreme3DBase[r1][t0]; 
+        q12 = mapExtreme3DBase[r0][t1]; q22 = mapExtreme3DBase[r1][t1];
     } else {
         uint8_t bufIdx = atomic_load(&activeMapIndex);
         q11 = activeCustomMapBuffer[bufIdx][r0][t0]; q21 = activeCustomMapBuffer[bufIdx][r1][t0]; 
@@ -418,7 +439,7 @@ static void IRAM_ATTR pulserISR(void* arg) {
     }
   }
 
-  // --- KOMPENSASI AKSELERASI LINEAR (Tanpa Pembagian Berat) ---
+  // --- KOMPENSASI AKSELERASI LINEAR ---
   int32_t accel_delta_us = (expected_interval > 0) ? ((int32_t)expected_interval - (int32_t)interval_us) : 0;
   
   uint32_t rpm = 60000000UL / interval_us; 
@@ -463,11 +484,10 @@ static void IRAM_ATTR pulserISR(void* arg) {
   uint32_t maxAllowedDwell = (interval_us > 1200) ? (interval_us - 800) : ((interval_us * 80) / 100);
   if (targetDwellUs > maxAllowedDwell) targetDwellUs = maxAllowedDwell;
 
-  // --- KALKULASI DELAY (Fixed-Point Math Menggantikan Pembagian 3600) ---
+  // --- KALKULASI DELAY (Fixed-Point Math) ---
   int32_t sparkDegFromPulser = ROTOR_PULSER_DEGREES_10 - adv10;
   if (sparkDegFromPulser < 0) sparkDegFromPulser = 0;
   
-  // Opt: sparkDelayUs = (sparkDegFromPulser * interval_us) / 3600;
   uint32_t sparkDelayUs = (uint32_t)(((uint64_t)sparkDegFromPulser * (uint64_t)interval_us * INV_3600_Q32) >> 32);
 
   if (accel_delta_us > 0 && sparkDelayUs > 0) {
@@ -527,9 +547,8 @@ void codeTaskIgnitionCalc(void * parameter) {
   }
 }
 
-// BATAS MAKSIMUM GRADIAN SENSOR UNTUK FILTER NOISE (MISRA Plausibility)
-#define MAX_TPS_GRADIENT_PER_10MS  15  // Maksimal lompatan 15% TPS per 10ms
-#define MAX_TEMP_GRADIENT_PER_10MS 50  // Maksimal lompatan 5.0 C per 10ms
+#define MAX_TPS_GRADIENT_PER_10MS  15  
+#define MAX_TEMP_GRADIENT_PER_10MS 50  
 
 void codeTaskSensor(void * parameter) {
   esp_task_wdt_add(NULL); 
@@ -548,13 +567,13 @@ void codeTaskSensor(void * parameter) {
         if (adc1_cali_handle) adc_cali_raw_to_voltage(adc1_cali_handle, rawTps, &mvTps);
         else mvTps = adc_raw_to_mv_fallback(rawTps);
 
-        adc_oneshot_read(adc1_handle, ADC_CHAN_BATT, &rawBatt);
-        if (adc1_cali_handle) adc_cali_raw_to_voltage(adc1_cali_handle, rawBatt, &mvBatt);
-        else mvBatt = adc_raw_to_mv_fallback(rawBatt); 
-
         adc_oneshot_read(adc1_handle, ADC_CHAN_TEMP, &rawTemp);
         if (adc1_cali_handle) adc_cali_raw_to_voltage(adc1_cali_handle, rawTemp, &mvTemp);
         else mvTemp = adc_raw_to_mv_fallback(rawTemp);
+
+        adc_oneshot_read(adc1_handle, ADC_CHAN_BATT, &rawBatt);
+        if (adc1_cali_handle) adc_cali_raw_to_voltage(adc1_cali_handle, rawBatt, &mvBatt);
+        else mvBatt = adc_raw_to_mv_fallback(rawBatt); 
     }
 
     bool rawFault = (rawBatt < 100 || rawBatt > 4050 || rawTps > 4050 || rawTemp < 50 || rawTemp > 4050);
@@ -565,14 +584,13 @@ void codeTaskSensor(void * parameter) {
     }
     
     emaTps  = (emaTps == 0)  ? mvTps  : (emaTps - (emaTps >> 2) + (mvTps >> 2));
-    emaBatt = (emaBatt == 0) ? mvBatt : (emaBatt - (emaBatt >> 2) + (mvBatt >> 2));
     emaTemp = (emaTemp == 0) ? mvTemp : (emaTemp - (emaTemp >> 2) + (mvTemp >> 2));
+    emaBatt = (emaBatt == 0) ? mvBatt : (emaBatt - (emaBatt >> 2) + (mvBatt >> 2));
 
     int32_t target_tps   = mapRange(emaTps, 450, 2800, 0, 100); 
-    uint16_t battV = (uint16_t)mapRange(emaBatt, 0, 3100, 0, 160);
     int32_t target_tempC  = mapRange(emaTemp, 300, 2800, -200, 1500);
+    uint16_t battV = (uint16_t)mapRange(emaBatt, 0, 3100, 0, 160);
 
-    // Filter Gradien (Rate-of-Change) untuk Plausibilitas Sensor
     uint8_t tpsP;
     if (target_tps > lastValidTps + MAX_TPS_GRADIENT_PER_10MS) {
         tpsP = lastValidTps + MAX_TPS_GRADIENT_PER_10MS;
@@ -594,8 +612,8 @@ void codeTaskSensor(void * parameter) {
     lastValidTemp = tempC;
 
     atomic_store(&currentTPS, tpsP); 
-    atomic_store(&currentBatteryVoltage10, battV); 
     atomic_store(&currentEngineTemp10, tempC); 
+    atomic_store(&currentBatteryVoltage10, battV); 
     atomic_store(&sensorFaultStatus, (faultCounter >= 10)); 
     
     uint32_t now = (uint32_t)esp_timer_get_time();
@@ -643,7 +661,7 @@ void codeTaskTachOutput(void * parameter) {
 }
 
 // -----------------------------------------------------------------------------
-// RTOS TASKS (CORE 0: SCRUBBER, TELEMETRI, & SERIAL STATE MACHINE PARSER)
+// RTOS TASKS (CORE 0: SCRUBBER, TELEMETRI, & SERIAL COMMAND)
 // -----------------------------------------------------------------------------
 void codeTaskMemoryScrubber(void * parameter) {
     for(;;) {
@@ -702,7 +720,6 @@ void codeTaskTelemetry(void * parameter) {
     
     pkt.crc16 = calculateCRC16((uint8_t*)&pkt, sizeof(TelemetryData) - sizeof(uint16_t));
     
-    // Non-Blocking Write: Cek buffer sebelum menulis agar task tidak freeze
     size_t free_tx;
     uart_get_tx_buffer_free_size(UART_NUM_2, &free_tx);
     if (free_tx >= sizeof(TelemetryData)) {
@@ -716,7 +733,6 @@ void codeTaskTelemetry(void * parameter) {
   }
 }
 
-// SERIAL STATE MACHINE (Tanpa Memmove - MISRA Compliant)
 void codeTaskCommandListener(void * parameter) {
   esp_task_wdt_add(NULL);
   static uint8_t rxBuf[sizeof(CommandPacket)];
@@ -729,15 +745,15 @@ void codeTaskCommandListener(void * parameter) {
     
     while (uart_read_bytes(UART_NUM_2, &byte, 1, pdMS_TO_TICKS(5)) > 0) {
       switch (syncState) {
-        case 0: // Tunggu Byte 1 (0x55)
+        case 0:
           if (byte == 0x55) { rxBuf[0] = byte; rxIdx = 1; syncState = 1; }
           break;
-        case 1: // Tunggu Byte 2 (0xCC)
+        case 1:
           if (byte == 0xCC) { rxBuf[1] = byte; rxIdx = 2; syncState = 2; }
           else if (byte == 0x55) { rxBuf[0] = byte; rxIdx = 1; } 
           else { syncState = 0; }
           break;
-        case 2: // Baca Sisa Payload
+        case 2:
           rxBuf[rxIdx++] = byte;
           if (rxIdx >= sizeof(CommandPacket)) {
             CommandPacket *cmd = (CommandPacket*)rxBuf;
@@ -882,8 +898,8 @@ void app_main(void) {
   
   adc_oneshot_chan_cfg_t config = { .bitwidth = ADC_BITWIDTH_12, .atten = ADC_ATTEN_TARGET };
   adc_oneshot_config_channel(adc1_handle, ADC_CHAN_TPS, &config); 
-  adc_oneshot_config_channel(adc1_handle, ADC_CHAN_BATT, &config); 
   adc_oneshot_config_channel(adc1_handle, ADC_CHAN_TEMP, &config);
+  adc_oneshot_config_channel(adc1_handle, ADC_CHAN_BATT, &config); 
 
   adc_cali_curve_fitting_config_t cali_config = { 
     .unit_id = ADC_UNIT_1, 
