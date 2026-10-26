@@ -618,7 +618,7 @@ void codeTaskSensor(void * parameter) {
     
     uint32_t now = (uint32_t)esp_timer_get_time();
     
-    if (ignState != IGN_IDLE && (now - charge_start_time_us) > 12000UL) {
+    if (ignState != IGN_IDLE && (now - charge_start_time_us) > 8000UL) {
         TCI_COIL_SPARK();
         ignState = IGN_IDLE;
     }
