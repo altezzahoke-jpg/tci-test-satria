@@ -1,6 +1,6 @@
 /* ==============================================================================
  * FIRMWARE ECU TCI SATRIA FU KARBURATOR (ESP32-S3) - DEDICATED ECU ENGINE NODE
- * LEVEL: OEM / AUTOMOTIVE GRADE (FIXED & FULLY OPTIMIZED)
+ * LEVEL: OEM / AUTOMOTIVE GRADE (FIXED & FULLY OPTIMIZED WITH HARDWARE FAULT DIAGNOSTICS)
  * ============================================================================== */
 
 #include <stdio.h>
@@ -33,13 +33,13 @@
 #endif
 
 // -----------------------------------------------------------------------------
-// KONFIGURASI HARDWARE ESP32-S3 (PEMETAAN PIN FINAL)
+// KONFIGURASI HARDWARE ESP32-S3 (PEMETAAN PIN UTAMA)
 // -----------------------------------------------------------------------------
-#define PIN_PULSER       GPIO_NUM_10
-#define PIN_TCI          GPIO_NUM_4
+#define PIN_PULSER       GPIO_NUM_14
+#define PIN_TCI          GPIO_NUM_16
 #define PIN_BUTTON_MODE  GPIO_NUM_6
-#define PIN_TX_TELEMETRY GPIO_NUM_13
-#define PIN_RX_TELEMETRY GPIO_NUM_12
+#define PIN_TX_TELEMETRY GPIO_NUM_20
+#define PIN_RX_TELEMETRY GPIO_NUM_19
 #define PIN_TACH_OUT     GPIO_NUM_42
 
 #define TCI_COIL_CHARGE() REG_WRITE(GPIO_OUT_W1TS_REG, (1UL << PIN_TCI)) 
@@ -49,15 +49,21 @@
 #define ADC_CHAN_TEMP    ADC_CHANNEL_1  // GPIO 2 (ADC1)
 #define ADC_CHAN_BATT    ADC_CHANNEL_2  // GPIO 3 (ADC1)
 
-#define WDT_TIMEOUT_MS   1000
+#define WDT_TIMEOUT_MS   600            
 #define NVS_NAMESPACE    "ecu_tci_cfg"
+
+// DEFINISI KODE KERUSAKAN HARDWARE (BITMASK)
+#define FAULT_NONE         0            // Normal / Tidak ada error
+#define FAULT_TPS_OUT      (1 << 0)     // Bit 0: TPS Error / Putus / Konslet
+#define FAULT_NTC_OUT      (1 << 1)     // Bit 1: NTC Temp Sensor Error
+#define FAULT_BATT_LOW     (1 << 2)     // Bit 2: Tegangan Aki Undervoltage (< 10V)
+#define FAULT_BATT_HIGH    (1 << 3)     // Bit 3: Overvoltage / Kiprok Rusak (> 16V)
 
 // MAKRO UTILITAS KESELAMATAN KODE (MISRA-C Compliance)
 #define ABS_VAL(x)       ((x) < 0 ? -(x) : (x))
 #define CLAMP(x, min, max) ((x) < (min) ? (min) : ((x) > (max) ? (max) : (x)))
 
 // PENGGANTI PEMBAGIAN ( / 3600) DI DALAM ISR (Q32 Fixed-Point Math)
-// 2^32 / 3600 = 1193046.47
 #define INV_3600_Q32     1193046ULL 
 
 typedef enum { STATE_STOPPED = 0, STATE_CRANKING, STATE_RUNNING, STATE_LIMP_HOME } EngineState;
@@ -108,6 +114,7 @@ _Atomic uint16_t currentBatteryVoltage10 = 126;
 _Atomic int16_t currentEngineTemp10 = 300;
 _Atomic int16_t currentDegree10 = 100;
 _Atomic bool sensorFaultStatus = false;
+_Atomic uint16_t hardwareFaultCode = FAULT_NONE; // Status spesifik hardware yang rusak
 _Atomic uint8_t activeMapIndex = 0;
 _Atomic uint8_t currentCustomSlot = 0;
 _Atomic uint8_t lastAckStatus = 0; 
@@ -146,6 +153,7 @@ typedef struct {
   uint8_t  fuel;      
   uint8_t  state;      
   uint8_t  ackStatus;  
+  uint16_t faultCode;  // Informasi bitmask error hardware
   uint16_t crc16;      
 } TelemetryData;
 
@@ -425,7 +433,7 @@ static void IRAM_ATTR pulserISR(void* arg) {
   uint32_t last_us = atomic_load(&last_pulse_time_us);
   uint32_t interval_us = now_us - last_us;
   
-  if (interval_us < 2000) return; // Proteksi bouncing ekstrim (>30,000 RPM)
+  if (interval_us < 2000) return; 
 
   uint32_t expected_interval = atomic_load(&pulse_interval_us);
 
@@ -439,7 +447,6 @@ static void IRAM_ATTR pulserISR(void* arg) {
     }
   }
 
-  // --- KOMPENSASI AKSELERASI LINEAR ---
   int32_t accel_delta_us = (expected_interval > 0) ? ((int32_t)expected_interval - (int32_t)interval_us) : 0;
   
   uint32_t rpm = 60000000UL / interval_us; 
@@ -457,7 +464,6 @@ static void IRAM_ATTR pulserISR(void* arg) {
 
   int16_t adv10 = atomic_load(&cachedAdv10);
 
-  // --- LIMIT RPM ---
   uint32_t safeMode;
   uint16_t currentLimit = 12500;
   uint16_t currentSoftLimit = 12300;
@@ -484,7 +490,6 @@ static void IRAM_ATTR pulserISR(void* arg) {
   uint32_t maxAllowedDwell = (interval_us > 1200) ? (interval_us - 800) : ((interval_us * 80) / 100);
   if (targetDwellUs > maxAllowedDwell) targetDwellUs = maxAllowedDwell;
 
-  // --- KALKULASI DELAY (Fixed-Point Math) ---
   int32_t sparkDegFromPulser = ROTOR_PULSER_DEGREES_10 - adv10;
   if (sparkDegFromPulser < 0) sparkDegFromPulser = 0;
   
@@ -523,10 +528,10 @@ static void IRAM_ATTR pulserISR(void* arg) {
 // RTOS TASKS (CORE 1: KRITIKAL & SENSOR)
 // -----------------------------------------------------------------------------
 void codeTaskIgnitionCalc(void * parameter) {
-  esp_task_wdt_add(NULL);
+  esp_task_wdt_add(NULL); 
   for (;;) {
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10)); 
-    esp_task_wdt_reset();
+    esp_task_wdt_reset(); 
 
     uint16_t rpm = atomic_load(&currentRPM);
     uint8_t tps = atomic_load(&currentTPS);
@@ -553,7 +558,6 @@ void codeTaskIgnitionCalc(void * parameter) {
 void codeTaskSensor(void * parameter) {
   esp_task_wdt_add(NULL); 
   static uint16_t emaTps = 0, emaBatt = 0, emaTemp = 0;
-  static uint8_t faultCounter = 0;
   static uint8_t lastValidTps = 0;
   static int16_t lastValidTemp = 300;
   
@@ -576,12 +580,23 @@ void codeTaskSensor(void * parameter) {
         else mvBatt = adc_raw_to_mv_fallback(rawBatt); 
     }
 
-    bool rawFault = (rawBatt < 100 || rawBatt > 4050 || rawTps > 4050 || rawTemp < 50 || rawTemp > 4050);
-    if (rawFault) {
-      if (faultCounter < 10) faultCounter++;
-    } else {
-      if (faultCounter > 0) faultCounter--;
+    // --- DETEKSI KONDISI HARDWARE SPESIFIK (FAULT DIAGNOSTICS) ---
+    uint16_t currentFaults = FAULT_NONE;
+
+    if (rawTps < 50 || rawTps > 4050) {
+        currentFaults |= FAULT_TPS_OUT; // TPS korslet / putus
     }
+    if (rawTemp < 30 || rawTemp > 4050) {
+        currentFaults |= FAULT_NTC_OUT; // NTC temp putus / korslet
+    }
+    if (rawBatt < 800) {
+        currentFaults |= FAULT_BATT_LOW;  // Aki dibawah 10V
+    } else if (rawBatt > 3800) {
+        currentFaults |= FAULT_BATT_HIGH; // Overcharge / Kiprok jebol (>16V)
+    }
+
+    atomic_store(&hardwareFaultCode, currentFaults);
+    atomic_store(&sensorFaultStatus, (currentFaults != FAULT_NONE));
     
     emaTps  = (emaTps == 0)  ? mvTps  : (emaTps - (emaTps >> 2) + (mvTps >> 2));
     emaTemp = (emaTemp == 0) ? mvTemp : (emaTemp - (emaTemp >> 2) + (mvTemp >> 2));
@@ -614,11 +629,10 @@ void codeTaskSensor(void * parameter) {
     atomic_store(&currentTPS, tpsP); 
     atomic_store(&currentEngineTemp10, tempC); 
     atomic_store(&currentBatteryVoltage10, battV); 
-    atomic_store(&sensorFaultStatus, (faultCounter >= 10)); 
     
     uint32_t now = (uint32_t)esp_timer_get_time();
     
-    if (ignState != IGN_IDLE && (now - charge_start_time_us) > 8000UL) {
+    if (ignState != IGN_IDLE && (now - charge_start_time_us) > 12000UL) {
         TCI_COIL_SPARK();
         ignState = IGN_IDLE;
     }
@@ -718,6 +732,9 @@ void codeTaskTelemetry(void * parameter) {
     pkt.fuel = currentFuel; 
     pkt.ackStatus = atomic_load(&lastAckStatus);
     
+    // Kirim kode error hardware spesifik ke display ESP32-C3
+    pkt.faultCode = atomic_load(&hardwareFaultCode);
+
     pkt.crc16 = calculateCRC16((uint8_t*)&pkt, sizeof(TelemetryData) - sizeof(uint16_t));
     
     size_t free_tx;
