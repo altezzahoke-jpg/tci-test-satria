@@ -1,6 +1,6 @@
 /* ==============================================================================
  * FIRMWARE ECU TCI SATRIA FU KARBURATOR (ESP32-S3) - DEDICATED ECU ENGINE NODE
- * LEVEL: OEM / AUTOMOTIVE GRADE (FIXED & FULLY OPTIMIZED WITH HARDWARE FAULT DIAGNOSTICS)
+ * LEVEL: OEM / AUTOMOTIVE GRADE (FIXED & FULLY SYNCED WITH ESP32-C3 TELEMETRY)
  * ============================================================================== */
 
 #include <stdio.h>
@@ -33,13 +33,13 @@
 #endif
 
 // -----------------------------------------------------------------------------
-// KONFIGURASI HARDWARE ESP32-S3 (PEMETAAN PIN UTAMA)
+// KONFIGURASI HARDWARE ESP32-S3 (SESUAI REVISI PIN TERBARU)
 // -----------------------------------------------------------------------------
 #define PIN_PULSER       GPIO_NUM_14
-#define PIN_TCI          GPIO_NUM_16
+#define PIN_TCI          GPIO_NUM_18
 #define PIN_BUTTON_MODE  GPIO_NUM_6
-#define PIN_TX_TELEMETRY GPIO_NUM_20
 #define PIN_RX_TELEMETRY GPIO_NUM_19
+#define PIN_TX_TELEMETRY GPIO_NUM_20
 #define PIN_TACH_OUT     GPIO_NUM_42
 
 #define TCI_COIL_CHARGE() REG_WRITE(GPIO_OUT_W1TS_REG, (1UL << PIN_TCI)) 
@@ -114,7 +114,7 @@ _Atomic uint16_t currentBatteryVoltage10 = 126;
 _Atomic int16_t currentEngineTemp10 = 300;
 _Atomic int16_t currentDegree10 = 100;
 _Atomic bool sensorFaultStatus = false;
-_Atomic uint16_t hardwareFaultCode = FAULT_NONE; // Status spesifik hardware yang rusak
+_Atomic uint16_t hardwareFaultCode = FAULT_NONE;
 _Atomic uint8_t activeMapIndex = 0;
 _Atomic uint8_t currentCustomSlot = 0;
 _Atomic uint8_t lastAckStatus = 0; 
@@ -125,7 +125,6 @@ _Atomic int16_t cachedAdv10 = 100;
 _Atomic uint32_t cachedDwellUs = 3200;
 
 _Atomic uint16_t activeCustomRpmLimit = 12500;
-_Atomic uint32_t activeCustomDwell = 3200;
 
 volatile IgnitionSequenceState ignState = IGN_IDLE;
 volatile uint64_t target_spark_count = 0;
@@ -141,9 +140,12 @@ adc_cali_handle_t adc1_cali_handle = NULL;
 #define NUM_TPS_POINTS 5
 #define MAX_CUSTOM_SLOTS 5
 
+// -----------------------------------------------------------------------------
+// STRUKTUR PAKET KOMUNIKASI UART (100% IDENTIK DENGAN ESP32-C3)
+// -----------------------------------------------------------------------------
 #pragma pack(push, 1)
 typedef struct {
-  uint16_t header;     
+  uint16_t header;     // 0xAA55
   uint16_t rpm;       
   uint8_t  tps;        
   int16_t  degree10;  
@@ -153,19 +155,19 @@ typedef struct {
   uint8_t  fuel;      
   uint8_t  state;      
   uint8_t  ackStatus;  
-  uint16_t faultCode;  // Informasi bitmask error hardware
+  uint16_t faultCode;  
   uint16_t crc16;      
-} TelemetryData;
+} TelemetryData;       // Total: 19 Bytes
 
 typedef struct {
-  uint16_t header;       
-  uint8_t  cmdType;      
+  uint16_t header;                                 // 0x55CC
+  uint8_t  cmdType;                                // 0x01: Mode, 0x02: RAM/Live Map, 0x03: Save NVS
   uint8_t  slotOrMode;   
-  int16_t  mapData[NUM_RPM_POINTS][NUM_TPS_POINTS]; 
-  uint16_t rpmLimit;
-  uint16_t dwellUs;
-  uint16_t crc16;      
-} CommandPacket;
+  int16_t  mapData[NUM_RPM_POINTS][NUM_TPS_POINTS]; // 150 Bytes
+  uint16_t dwellData[NUM_RPM_POINTS];               // 30 Bytes (Per-RPM Dwell Curve)
+  uint16_t rpmLimit;                                // 2 Bytes
+  uint16_t crc16;                                   // 2 Bytes
+} CommandPacket;                                    // Total: 188 Bytes
 #pragma pack(pop)
 
 const int16_t ROTOR_PULSER_DEGREES_10 = 350; 
@@ -197,10 +199,16 @@ DRAM_ATTR const int16_t mapExtreme3DBase[NUM_RPM_POINTS][NUM_TPS_POINTS] = {
   {320, 350, 380, 380, 380}, {300, 310, 340, 340, 340}, {280, 280, 300, 300, 300}
 };
 
+DRAM_ATTR const uint16_t defaultDwellPerRPM[NUM_RPM_POINTS] = {
+  3500, 3500, 3400, 3300, 3200, 3100, 3000, 2900, 2800, 2700, 2600, 2500, 2400, 2300, 2200
+};
+
 DRAM_ATTR int16_t mapCustomSlots[MAX_CUSTOM_SLOTS][NUM_RPM_POINTS][NUM_TPS_POINTS];
+DRAM_ATTR uint16_t dwellCustomSlots[MAX_CUSTOM_SLOTS][NUM_RPM_POINTS];
 DRAM_ATTR uint16_t rpmLimitCustomSlots[MAX_CUSTOM_SLOTS];
-DRAM_ATTR uint16_t dwellCustomSlots[MAX_CUSTOM_SLOTS];
+
 DRAM_ATTR int16_t activeCustomMapBuffer[2][NUM_RPM_POINTS][NUM_TPS_POINTS];
+DRAM_ATTR uint16_t activeCustomDwellBuffer[2][NUM_RPM_POINTS];
 
 // -----------------------------------------------------------------------------
 // UTILITAS & NVS STORAGE OPERASIONAL
@@ -248,9 +256,9 @@ void updateActiveMapBuffer(void) {
   if (slot >= MAX_CUSTOM_SLOTS) slot = 0;
   uint8_t nextBuf = 1 - atomic_load(&activeMapIndex);
   memcpy(activeCustomMapBuffer[nextBuf], mapCustomSlots[slot], sizeof(activeCustomMapBuffer[0]));
+  memcpy(activeCustomDwellBuffer[nextBuf], dwellCustomSlots[slot], sizeof(activeCustomDwellBuffer[0]));
   
   atomic_store(&activeCustomRpmLimit, rpmLimitCustomSlots[slot]);
-  atomic_store(&activeCustomDwell, dwellCustomSlots[slot]);
   atomic_store(&activeMapIndex, nextBuf);
 }
 
@@ -266,8 +274,8 @@ esp_err_t nvs_save_custom_slot(uint8_t slot) {
     snprintf(k_dwl, sizeof(k_dwl), "dwl_s%d", slot);
 
     nvs_set_blob(h, k_map, mapCustomSlots[slot], sizeof(mapCustomSlots[slot]));
+    nvs_set_blob(h, k_dwl, dwellCustomSlots[slot], sizeof(dwellCustomSlots[slot]));
     nvs_set_u16(h, k_lim, rpmLimitCustomSlots[slot]);
-    nvs_set_u16(h, k_dwl, (uint16_t)dwellCustomSlots[slot]);
 
     err = nvs_commit(h);
     nvs_close(h);
@@ -300,15 +308,19 @@ void initNvsAndLoadMaps(void) {
           snprintf(k_lim, sizeof(k_lim), "lim_s%d", i);
           snprintf(k_dwl, sizeof(k_dwl), "dwl_s%d", i);
 
-          size_t sz = sizeof(mapCustomSlots[i]);
-          if (nvs_get_blob(h, k_map, mapCustomSlots[i], &sz) != ESP_OK || sz != sizeof(mapCustomSlots[i])) {
+          size_t szMap = sizeof(mapCustomSlots[i]);
+          if (nvs_get_blob(h, k_map, mapCustomSlots[i], &szMap) != ESP_OK || szMap != sizeof(mapCustomSlots[i])) {
               memcpy(&mapCustomSlots[i], &mapDaily3DBase, sizeof(mapDaily3DBase));
           }
-          uint16_t lim = 12500, dwl = 3200;
+          
+          size_t szDwl = sizeof(dwellCustomSlots[i]);
+          if (nvs_get_blob(h, k_dwl, dwellCustomSlots[i], &szDwl) != ESP_OK || szDwl != sizeof(dwellCustomSlots[i])) {
+              memcpy(&dwellCustomSlots[i], &defaultDwellPerRPM, sizeof(defaultDwellPerRPM));
+          }
+
+          uint16_t lim = 12500;
           nvs_get_u16(h, k_lim, &lim);
-          nvs_get_u16(h, k_dwl, &dwl);
           rpmLimitCustomSlots[i] = lim;
-          dwellCustomSlots[i] = dwl;
       }
       uint8_t savedMode = MODE_DAILY;
       if (nvs_get_u8(h, "act_mode", &savedMode) == ESP_OK && savedMode <= MODE_CUSTOM) {
@@ -318,8 +330,8 @@ void initNvsAndLoadMaps(void) {
   } else {
       for (int i = 0; i < MAX_CUSTOM_SLOTS; i++) {
         memcpy(&mapCustomSlots[i], &mapDaily3DBase, sizeof(mapDaily3DBase));
+        memcpy(&dwellCustomSlots[i], &defaultDwellPerRPM, sizeof(defaultDwellPerRPM));
         rpmLimitCustomSlots[i] = 12500;
-        dwellCustomSlots[i] = 3200;
       }
   }
   updateActiveMapBuffer();
@@ -335,9 +347,22 @@ typedef struct {
 
 IgnitionCommand_t HAL_IgnitionLogic_Calculate(uint16_t rpm, uint8_t tps, int16_t temp10, uint16_t batt10, ModePengapian mode, EngineState state, bool fault) {
     IgnitionCommand_t cmd;
-    
+
+    uint16_t calcRpm = CLAMP(rpm, 0, rpmAxis[NUM_RPM_POINTS - 1]);
+    uint8_t calcTps = CLAMP(tps, 0, 100);
+
+    uint8_t r0 = calcRpm / 1000;
+    if (r0 >= NUM_RPM_POINTS - 1) r0 = NUM_RPM_POINTS - 2;
+    uint8_t t0 = calcTps / 25;
+    if (t0 >= NUM_TPS_POINTS - 1) t0 = NUM_TPS_POINTS - 2;
+    uint8_t r1 = r0 + 1, t1 = t0 + 1;
+    int32_t rF = ((int32_t)(calcRpm - (r0 * 1000)) * 1024) / 1000;
+
     if (mode == MODE_CUSTOM) {
-        cmd.finalDwellUs = atomic_load(&activeCustomDwell);
+        uint8_t bufIdx = atomic_load(&activeMapIndex);
+        uint16_t d0 = activeCustomDwellBuffer[bufIdx][r0];
+        uint16_t d1 = activeCustomDwellBuffer[bufIdx][r1];
+        cmd.finalDwellUs = (uint32_t)(d0 + (((int32_t)d1 - (int32_t)d0) * rF) / 1024);
     } else {
         if      (batt10 < 100) cmd.finalDwellUs = 4500; 
         else if (batt10 < 115) cmd.finalDwellUs = 3800;
@@ -356,15 +381,6 @@ IgnitionCommand_t HAL_IgnitionLogic_Calculate(uint16_t rpm, uint8_t tps, int16_t
         return cmd;
     }
 
-    uint16_t calcRpm = CLAMP(rpm, 0, rpmAxis[NUM_RPM_POINTS - 1]);
-    uint8_t calcTps = CLAMP(tps, 0, 100);
-
-    uint8_t r0 = calcRpm / 1000;
-    if (r0 >= NUM_RPM_POINTS - 1) r0 = NUM_RPM_POINTS - 2;
-    uint8_t t0 = calcTps / 25;
-    if (t0 >= NUM_TPS_POINTS - 1) t0 = NUM_TPS_POINTS - 2;
-    uint8_t r1 = r0 + 1, t1 = t0 + 1;
-    
     int16_t q11, q21, q12, q22;
     if (mode == MODE_DAILY) {
         q11 = mapDaily3DBase[r0][t0]; q21 = mapDaily3DBase[r1][t0]; 
@@ -381,7 +397,6 @@ IgnitionCommand_t HAL_IgnitionLogic_Calculate(uint16_t rpm, uint8_t tps, int16_t
         q12 = activeCustomMapBuffer[bufIdx][r0][t1]; q22 = activeCustomMapBuffer[bufIdx][r1][t1];
     }
 
-    int32_t rF = ((int32_t)(calcRpm - (r0 * 1000)) * 1024) / 1000;
     int32_t tF = ((int32_t)(calcTps - (t0 * 25)) * 1024) / 25;
     int32_t R1 = q11 + ((q21 - q11) * rF) / 1024;
     int32_t R2 = q12 + ((q22 - q12) * rF) / 1024;
@@ -399,7 +414,7 @@ IgnitionCommand_t HAL_IgnitionLogic_Calculate(uint16_t rpm, uint8_t tps, int16_t
 }
 
 // -----------------------------------------------------------------------------
-// INTERRUPTS & TIMERS SANGAT PRESISI
+// INTERRUPTS & TIMERS SANGAT PRESISI (IRAM-SAFE)
 // -----------------------------------------------------------------------------
 static bool IRAM_ATTR onIgnitionTimer(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx) {
   if (ignState == IGN_WAITING_CHARGE) {
@@ -407,8 +422,7 @@ static bool IRAM_ATTR onIgnitionTimer(gptimer_handle_t timer, const gptimer_alar
     charge_start_time_us = (uint32_t)esp_timer_get_time();
     ignState = IGN_WAITING_SPARK;
     
-    uint64_t now_cnt = 0;
-    gptimer_get_raw_count(timer, &now_cnt);
+    uint64_t now_cnt = edata->count_value;
     
     if (target_spark_count <= now_cnt + 5) {
         TCI_COIL_SPARK();
@@ -584,15 +598,15 @@ void codeTaskSensor(void * parameter) {
     uint16_t currentFaults = FAULT_NONE;
 
     if (rawTps < 50 || rawTps > 4050) {
-        currentFaults |= FAULT_TPS_OUT; // TPS korslet / putus
+        currentFaults |= FAULT_TPS_OUT; 
     }
     if (rawTemp < 30 || rawTemp > 4050) {
-        currentFaults |= FAULT_NTC_OUT; // NTC temp putus / korslet
+        currentFaults |= FAULT_NTC_OUT; 
     }
     if (rawBatt < 800) {
-        currentFaults |= FAULT_BATT_LOW;  // Aki dibawah 10V
+        currentFaults |= FAULT_BATT_LOW;  
     } else if (rawBatt > 3800) {
-        currentFaults |= FAULT_BATT_HIGH; // Overcharge / Kiprok jebol (>16V)
+        currentFaults |= FAULT_BATT_HIGH; 
     }
 
     atomic_store(&hardwareFaultCode, currentFaults);
@@ -731,8 +745,6 @@ void codeTaskTelemetry(void * parameter) {
     pkt.state = (uint8_t)s;
     pkt.fuel = currentFuel; 
     pkt.ackStatus = atomic_load(&lastAckStatus);
-    
-    // Kirim kode error hardware spesifik ke display ESP32-C3
     pkt.faultCode = atomic_load(&hardwareFaultCode);
 
     pkt.crc16 = calculateCRC16((uint8_t*)&pkt, sizeof(TelemetryData) - sizeof(uint16_t));
@@ -789,8 +801,8 @@ void codeTaskCommandListener(void * parameter) {
                 uint8_t slot = cmd->slotOrMode;
                 if (slot < MAX_CUSTOM_SLOTS) {
                   memcpy(mapCustomSlots[slot], cmd->mapData, sizeof(cmd->mapData));
+                  memcpy(dwellCustomSlots[slot], cmd->dwellData, sizeof(cmd->dwellData));
                   rpmLimitCustomSlots[slot] = cmd->rpmLimit;
-                  dwellCustomSlots[slot] = cmd->dwellUs;
                   
                   atomic_store(&currentCustomSlot, slot);
                   updateActiveMapBuffer(); 
@@ -932,7 +944,8 @@ void app_main(void) {
   gptimer_config_t timer_cfg = { 
     .clk_src = GPTIMER_CLK_SRC_DEFAULT, 
     .direction = GPTIMER_COUNT_UP, 
-    .resolution_hz = 1000000 
+    .resolution_hz = 1000000,
+    .flags.intr_shared = false
   };
   gptimer_new_timer(&timer_cfg, &timerIgnition); 
   gptimer_event_callbacks_t cbs = { .on_alarm = onIgnitionTimer }; 
