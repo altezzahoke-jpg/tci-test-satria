@@ -1,6 +1,6 @@
 /* ==============================================================================
  * FIRMWARE ECU TCI SATRIA FU KARBURATOR (ESP32-S3) - DEDICATED ECU ENGINE NODE
- * LEVEL: OEM / AUTOMOTIVE GRADE (FIXED & FULLY SYNCED WITH ESP32-C3 TELEMETRY)
+ * LEVEL: OEM / AUTOMOTIVE GRADE (FINAL SYNCED & HARDENED VERSION)
  * ============================================================================== */
 
 #include <stdio.h>
@@ -32,14 +32,11 @@
 #define ADC_ATTEN_TARGET ADC_ATTEN_DB_11
 #endif
 
-// -----------------------------------------------------------------------------
-// KONFIGURASI HARDWARE ESP32-S3 (SESUAI REVISI PIN TERBARU)
-// -----------------------------------------------------------------------------
+// --- KONFIGURASI PIN HARDWARE ESP32-S3 ---
 #define PIN_PULSER       GPIO_NUM_14
 #define PIN_TCI          GPIO_NUM_18
-#define PIN_BUTTON_MODE  GPIO_NUM_6
-#define PIN_RX_TELEMETRY GPIO_NUM_20
-#define PIN_TX_TELEMETRY GPIO_NUM_19
+#define PIN_RX_TELEMETRY GPIO_NUM_19
+#define PIN_TX_TELEMETRY GPIO_NUM_20
 #define PIN_TACH_OUT     GPIO_NUM_42
 
 #define TCI_COIL_CHARGE() REG_WRITE(GPIO_OUT_W1TS_REG, (1UL << PIN_TCI)) 
@@ -52,18 +49,15 @@
 #define WDT_TIMEOUT_MS   600            
 #define NVS_NAMESPACE    "ecu_tci_cfg"
 
-// DEFINISI KODE KERUSAKAN HARDWARE (BITMASK)
-#define FAULT_NONE         0            // Normal / Tidak ada error
-#define FAULT_TPS_OUT      (1 << 0)     // Bit 0: TPS Error / Putus / Konslet
-#define FAULT_NTC_OUT      (1 << 1)     // Bit 1: NTC Temp Sensor Error
-#define FAULT_BATT_LOW     (1 << 2)     // Bit 2: Tegangan Aki Undervoltage (< 10V)
-#define FAULT_BATT_HIGH    (1 << 3)     // Bit 3: Overvoltage / Kiprok Rusak (> 16V)
+// --- DEFINISI KODE KERUSAKAN HARDWARE (BITMASK) ---
+#define FAULT_NONE         0            
+#define FAULT_TPS_OUT      (1 << 0)     
+#define FAULT_NTC_OUT      (1 << 1)     
+#define FAULT_BATT_LOW     (1 << 2)     
+#define FAULT_BATT_HIGH    (1 << 3)     
 
-// MAKRO UTILITAS KESELAMATAN KODE (MISRA-C Compliance)
 #define ABS_VAL(x)       ((x) < 0 ? -(x) : (x))
 #define CLAMP(x, min, max) ((x) < (min) ? (min) : ((x) > (max) ? (max) : (x)))
-
-// PENGGANTI PEMBAGIAN ( / 3600) DI DALAM ISR (Q32 Fixed-Point Math)
 #define INV_3600_Q32     1193046ULL 
 
 typedef enum { STATE_STOPPED = 0, STATE_CRANKING, STATE_RUNNING, STATE_LIMP_HOME } EngineState;
@@ -71,9 +65,7 @@ typedef enum { MODE_DAILY = 0, MODE_RACING, MODE_EXTREME, MODE_CUSTOM } ModePeng
 typedef enum { BBM_PERTALITE = 0, BBM_PERTAMAX } JenisBBM;
 typedef enum { IGN_IDLE = 0, IGN_WAITING_CHARGE, IGN_WAITING_SPARK } IgnitionSequenceState;
 
-// -----------------------------------------------------------------------------
-// RAM MEMORY SCRUBBING & E2E DATA PROTECTION (ISO 26262 ASIL-B)
-// -----------------------------------------------------------------------------
+// --- RAM MEMORY SCRUBBING & E2E DATA PROTECTION ---
 portMUX_TYPE secure_mux = portMUX_INITIALIZER_UNLOCKED;
 
 typedef struct {
@@ -105,9 +97,7 @@ bool IRAM_ATTR SecureData_Read(SecureData_t* sec, uint32_t* out_value) {
     return false;
 }
 
-// -----------------------------------------------------------------------------
-// VARIABEL GLOBAL ATOMIK (LOCK-FREE RTOS)
-// -----------------------------------------------------------------------------
+// --- VARIABEL GLOBAL ATOMIK (LOCK-FREE RTOS) ---
 _Atomic uint16_t currentRPM = 0;
 _Atomic uint8_t currentTPS = 0;
 _Atomic uint16_t currentBatteryVoltage10 = 126;
@@ -123,7 +113,6 @@ _Atomic uint32_t pulse_interval_us = 0;
 _Atomic uint32_t last_pulse_time_us = 0;
 _Atomic int16_t cachedAdv10 = 100;
 _Atomic uint32_t cachedDwellUs = 3200;
-
 _Atomic uint16_t activeCustomRpmLimit = 12500;
 
 volatile IgnitionSequenceState ignState = IGN_IDLE;
@@ -140,9 +129,7 @@ adc_cali_handle_t adc1_cali_handle = NULL;
 #define NUM_TPS_POINTS 5
 #define MAX_CUSTOM_SLOTS 5
 
-// -----------------------------------------------------------------------------
-// STRUKTUR PAKET KOMUNIKASI UART (100% IDENTIK DENGAN ESP32-C3)
-// -----------------------------------------------------------------------------
+// --- STRUKTUR PAKET KOMUNIKASI UART (100% SINKRON DENGAN ESP32-C3) ---
 #pragma pack(push, 1)
 typedef struct {
   uint16_t header;     // 0xAA55
@@ -161,10 +148,10 @@ typedef struct {
 
 typedef struct {
   uint16_t header;                                 // 0x55CC
-  uint8_t  cmdType;                                // 0x01: Mode, 0x02: RAM/Live Map, 0x03: Save NVS
+  uint8_t  cmdType;                                // 0x01: Mode, 0x02: RAM Map, 0x03: Save NVS
   uint8_t  slotOrMode;   
   int16_t  mapData[NUM_RPM_POINTS][NUM_TPS_POINTS]; // 150 Bytes
-  uint16_t dwellData[NUM_RPM_POINTS];               // 30 Bytes (Per-RPM Dwell Curve)
+  uint16_t dwellData[NUM_RPM_POINTS];               // 30 Bytes
   uint16_t rpmLimit;                                // 2 Bytes
   uint16_t crc16;                                   // 2 Bytes
 } CommandPacket;                                    // Total: 188 Bytes
@@ -210,9 +197,6 @@ DRAM_ATTR uint16_t rpmLimitCustomSlots[MAX_CUSTOM_SLOTS];
 DRAM_ATTR int16_t activeCustomMapBuffer[2][NUM_RPM_POINTS][NUM_TPS_POINTS];
 DRAM_ATTR uint16_t activeCustomDwellBuffer[2][NUM_RPM_POINTS];
 
-// -----------------------------------------------------------------------------
-// UTILITAS & NVS STORAGE OPERASIONAL
-// -----------------------------------------------------------------------------
 static int32_t adc_raw_to_mv_fallback(int raw) {
     if (raw <= 0) return 0;
     if (raw >= 4095) return 3300;
@@ -255,10 +239,14 @@ void updateActiveMapBuffer(void) {
   uint8_t slot = atomic_load(&currentCustomSlot);
   if (slot >= MAX_CUSTOM_SLOTS) slot = 0;
   uint8_t nextBuf = 1 - atomic_load(&activeMapIndex);
+  
+  portENTER_CRITICAL_SAFE(&secure_mux);
   memcpy(activeCustomMapBuffer[nextBuf], mapCustomSlots[slot], sizeof(activeCustomMapBuffer[0]));
   memcpy(activeCustomDwellBuffer[nextBuf], dwellCustomSlots[slot], sizeof(activeCustomDwellBuffer[0]));
+  uint16_t limit = rpmLimitCustomSlots[slot];
+  portEXIT_CRITICAL_SAFE(&secure_mux);
   
-  atomic_store(&activeCustomRpmLimit, rpmLimitCustomSlots[slot]);
+  atomic_store(&activeCustomRpmLimit, limit);
   atomic_store(&activeMapIndex, nextBuf);
 }
 
@@ -337,9 +325,6 @@ void initNvsAndLoadMaps(void) {
   updateActiveMapBuffer();
 }
 
-// -----------------------------------------------------------------------------
-// HARDWARE ABSTRACTION LAYER (HAL) LOGIK KRITIKAL
-// -----------------------------------------------------------------------------
 typedef struct {
     int16_t finalAdvance10;
     uint32_t finalDwellUs;
@@ -413,9 +398,6 @@ IgnitionCommand_t HAL_IgnitionLogic_Calculate(uint16_t rpm, uint8_t tps, int16_t
     return cmd;
 }
 
-// -----------------------------------------------------------------------------
-// INTERRUPTS & TIMERS SANGAT PRESISI (IRAM-SAFE)
-// -----------------------------------------------------------------------------
 static bool IRAM_ATTR onIgnitionTimer(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx) {
   if (ignState == IGN_WAITING_CHARGE) {
     TCI_COIL_CHARGE();
@@ -424,7 +406,7 @@ static bool IRAM_ATTR onIgnitionTimer(gptimer_handle_t timer, const gptimer_alar
     
     uint64_t now_cnt = edata->count_value;
     
-    if (target_spark_count <= now_cnt + 5) {
+    if (target_spark_count <= now_cnt + 15) {
         TCI_COIL_SPARK();
         ignState = IGN_IDLE;
     } else {
@@ -522,7 +504,7 @@ static void IRAM_ATTR pulserISR(void* arg) {
     uint64_t current_count;
     gptimer_get_raw_count(timerIgnition, &current_count);
     uint64_t spark_count = current_count + sparkDelayUs;
-    uint64_t charge_count = (sparkDelayUs > targetDwellUs) ? (spark_count - targetDwellUs) : (current_count + 5);
+    uint64_t charge_count = (sparkDelayUs > targetDwellUs) ? (spark_count - targetDwellUs) : (current_count + 15);
     
     target_spark_count = spark_count;
     ignState = IGN_WAITING_CHARGE;
@@ -538,9 +520,6 @@ static void IRAM_ATTR pulserISR(void* arg) {
   if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
 }
 
-// -----------------------------------------------------------------------------
-// RTOS TASKS (CORE 1: KRITIKAL & SENSOR)
-// -----------------------------------------------------------------------------
 void codeTaskIgnitionCalc(void * parameter) {
   esp_task_wdt_add(NULL); 
   for (;;) {
@@ -594,20 +573,12 @@ void codeTaskSensor(void * parameter) {
         else mvBatt = adc_raw_to_mv_fallback(rawBatt); 
     }
 
-    // --- DETEKSI KONDISI HARDWARE SPESIFIK (FAULT DIAGNOSTICS) ---
     uint16_t currentFaults = FAULT_NONE;
 
-    if (rawTps < 50 || rawTps > 4050) {
-        currentFaults |= FAULT_TPS_OUT; 
-    }
-    if (rawTemp < 30 || rawTemp > 4050) {
-        currentFaults |= FAULT_NTC_OUT; 
-    }
-    if (rawBatt < 800) {
-        currentFaults |= FAULT_BATT_LOW;  
-    } else if (rawBatt > 3800) {
-        currentFaults |= FAULT_BATT_HIGH; 
-    }
+    if (rawTps < 50 || rawTps > 4050) currentFaults |= FAULT_TPS_OUT; 
+    if (rawTemp < 30 || rawTemp > 4050) currentFaults |= FAULT_NTC_OUT; 
+    if (rawBatt < 800) currentFaults |= FAULT_BATT_LOW;  
+    else if (rawBatt > 3800) currentFaults |= FAULT_BATT_HIGH; 
 
     atomic_store(&hardwareFaultCode, currentFaults);
     atomic_store(&sensorFaultStatus, (currentFaults != FAULT_NONE));
@@ -620,24 +591,12 @@ void codeTaskSensor(void * parameter) {
     int32_t target_tempC  = mapRange(emaTemp, 300, 2800, -200, 1500);
     uint16_t battV = (uint16_t)mapRange(emaBatt, 0, 3100, 0, 160);
 
-    uint8_t tpsP;
-    if (target_tps > lastValidTps + MAX_TPS_GRADIENT_PER_10MS) {
-        tpsP = lastValidTps + MAX_TPS_GRADIENT_PER_10MS;
-    } else if (target_tps < lastValidTps - MAX_TPS_GRADIENT_PER_10MS) {
-        tpsP = lastValidTps - MAX_TPS_GRADIENT_PER_10MS;
-    } else {
-        tpsP = (uint8_t)target_tps;
-    }
+    uint8_t tpsP = (target_tps > lastValidTps + MAX_TPS_GRADIENT_PER_10MS) ? (lastValidTps + MAX_TPS_GRADIENT_PER_10MS) :
+                   (target_tps < lastValidTps - MAX_TPS_GRADIENT_PER_10MS) ? (lastValidTps - MAX_TPS_GRADIENT_PER_10MS) : (uint8_t)target_tps;
     lastValidTps = tpsP;
 
-    int16_t tempC;
-    if (target_tempC > lastValidTemp + MAX_TEMP_GRADIENT_PER_10MS) {
-        tempC = lastValidTemp + MAX_TEMP_GRADIENT_PER_10MS;
-    } else if (target_tempC < lastValidTemp - MAX_TEMP_GRADIENT_PER_10MS) {
-        tempC = lastValidTemp - MAX_TEMP_GRADIENT_PER_10MS;
-    } else {
-        tempC = (int16_t)target_tempC;
-    }
+    int16_t tempC = (target_tempC > lastValidTemp + MAX_TEMP_GRADIENT_PER_10MS) ? (lastValidTemp + MAX_TEMP_GRADIENT_PER_10MS) :
+                    (target_tempC < lastValidTemp - MAX_TEMP_GRADIENT_PER_10MS) ? (lastValidTemp - MAX_TEMP_GRADIENT_PER_10MS) : (int16_t)target_tempC;
     lastValidTemp = tempC;
 
     atomic_store(&currentTPS, tpsP); 
@@ -645,13 +604,13 @@ void codeTaskSensor(void * parameter) {
     atomic_store(&currentBatteryVoltage10, battV); 
     
     uint32_t now = (uint32_t)esp_timer_get_time();
-    
     if (ignState != IGN_IDLE && (now - charge_start_time_us) > 12000UL) {
         TCI_COIL_SPARK();
         ignState = IGN_IDLE;
     }
 
-    if ((now - atomic_load(&last_pulse_time_us)) > 200000UL && atomic_load(&currentRPM) != 0) {
+    // Timeout 600ms (600000us) agar proses cold cranking (starter pelan) tidak false-stop
+    if ((now - atomic_load(&last_pulse_time_us)) > 600000UL && atomic_load(&currentRPM) != 0) {
       atomic_store(&currentRPM, 0);
       SecureData_Write(&sec_engine_state, (uint32_t)STATE_STOPPED);
       atomic_store(&pulse_interval_us, 0);
@@ -688,42 +647,13 @@ void codeTaskTachOutput(void * parameter) {
   }
 }
 
-// -----------------------------------------------------------------------------
-// RTOS TASKS (CORE 0: SCRUBBER, TELEMETRI, & SERIAL COMMAND)
-// -----------------------------------------------------------------------------
 void codeTaskMemoryScrubber(void * parameter) {
     for(;;) {
         uint32_t dummy;
-        if (!SecureData_Read(&sec_mode, &dummy)) {
-            SecureData_Write(&sec_mode, (uint32_t)MODE_DAILY); 
-        }
-        if (!SecureData_Read(&sec_engine_state, &dummy)) {
-            SecureData_Write(&sec_engine_state, (uint32_t)STATE_STOPPED);
-        }
+        if (!SecureData_Read(&sec_mode, &dummy)) SecureData_Write(&sec_mode, (uint32_t)MODE_DAILY); 
+        if (!SecureData_Read(&sec_engine_state, &dummy)) SecureData_Write(&sec_engine_state, (uint32_t)STATE_STOPPED);
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-}
-
-void codeTaskModeButton(void * parameter) {
-  esp_task_wdt_add(NULL);
-  uint32_t lastBtnTime = 0;
-  for (;;) {
-    esp_task_wdt_reset();
-    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-    
-    if (gpio_get_level(PIN_BUTTON_MODE) == 0 && (now - lastBtnTime > 300)) {
-      if (isEngineStopped()) {
-        uint32_t safeMode;
-        if (SecureData_Read(&sec_mode, &safeMode)) {
-            uint32_t nextMode = (safeMode + 1) % 4;
-            SecureData_Write(&sec_mode, nextMode); 
-            nvs_save_mode((uint8_t)nextMode);
-        }
-      }
-      lastBtnTime = now;
-    }
-    vTaskDelay(pdMS_TO_TICKS(50));
-  }
 }
 
 void codeTaskTelemetry(void * parameter) {
@@ -755,9 +685,7 @@ void codeTaskTelemetry(void * parameter) {
         uart_write_bytes(UART_NUM_2, (const char*)&pkt, sizeof(TelemetryData));
     }
 
-    if (pkt.ackStatus != 0) {
-      atomic_store(&lastAckStatus, 0);
-    }
+    if (pkt.ackStatus != 0) atomic_store(&lastAckStatus, 0);
     vTaskDelay(pdMS_TO_TICKS(50)); 
   }
 }
@@ -793,21 +721,26 @@ void codeTaskCommandListener(void * parameter) {
               
               if (cmd->cmdType == 0x01) { 
                 if (cmd->slotOrMode <= MODE_CUSTOM) {
-                  SecureData_Write(&sec_mode, (uint32_t)cmd->slotOrMode);
-                  if (isEngineStopped()) nvs_save_mode((uint8_t)cmd->slotOrMode);
+                  if (isEngineStopped()) {
+                    SecureData_Write(&sec_mode, (uint32_t)cmd->slotOrMode);
+                    nvs_save_mode((uint8_t)cmd->slotOrMode);
+                  }
                 }
               } 
               else if (cmd->cmdType == 0x02 || cmd->cmdType == 0x03) { 
                 uint8_t slot = cmd->slotOrMode;
                 if (slot < MAX_CUSTOM_SLOTS) {
+                  // Lindungi penyalinan data map besar dengan secure_mux agar bebas race condition
+                  portENTER_CRITICAL_SAFE(&secure_mux);
                   memcpy(mapCustomSlots[slot], cmd->mapData, sizeof(cmd->mapData));
                   memcpy(dwellCustomSlots[slot], cmd->dwellData, sizeof(cmd->dwellData));
                   rpmLimitCustomSlots[slot] = cmd->rpmLimit;
+                  portEXIT_CRITICAL_SAFE(&secure_mux);
                   
                   atomic_store(&currentCustomSlot, slot);
                   updateActiveMapBuffer(); 
 
-                  if (isEngineStopped() || cmd->cmdType == 0x03) {
+                  if (isEngineStopped()) {
                     nvs_save_custom_slot(slot);
                   }
                 }
@@ -823,41 +756,26 @@ void codeTaskCommandListener(void * parameter) {
   }
 }
 
-// -----------------------------------------------------------------------------
-// MEMORI STATIS ALOKASI RTOS TASKS
-// -----------------------------------------------------------------------------
 #define STACK_SIZE_IGN   4096
 #define STACK_SIZE_SENS  4096
 #define STACK_SIZE_TACH  2048
 #define STACK_SIZE_SCRUB 2048
-#define STACK_SIZE_BTN   2048
 #define STACK_SIZE_TEL   3072
 #define STACK_SIZE_CMD   4096
 
 static StackType_t ignTaskStack[STACK_SIZE_IGN];
 static StaticTask_t ignTaskBuffer;
-
 static StackType_t sensTaskStack[STACK_SIZE_SENS];
 static StaticTask_t sensTaskBuffer;
-
 static StackType_t tachTaskStack[STACK_SIZE_TACH];
 static StaticTask_t tachTaskBuffer;
-
 static StackType_t scrubTaskStack[STACK_SIZE_SCRUB];
 static StaticTask_t scrubTaskBuffer;
-
-static StackType_t btnTaskStack[STACK_SIZE_BTN];
-static StaticTask_t btnTaskBuffer;
-
 static StackType_t telTaskStack[STACK_SIZE_TEL];
 static StaticTask_t telTaskBuffer;
-
 static StackType_t cmdTaskStack[STACK_SIZE_CMD];
 static StaticTask_t cmdTaskBuffer;
 
-// -----------------------------------------------------------------------------
-// MAIN ENTRY POINT
-// -----------------------------------------------------------------------------
 void app_main(void) {
   esp_ota_mark_app_valid_cancel_rollback(); 
 
@@ -882,14 +800,6 @@ void app_main(void) {
   };
   gpio_config(&io_out); 
   TCI_COIL_SPARK(); 
-  
-  gpio_config_t io_in = {
-    .pin_bit_mask = (1ULL << PIN_BUTTON_MODE),
-    .mode = GPIO_MODE_INPUT,
-    .pull_up_en = 1,
-    .intr_type = GPIO_INTR_DISABLE
-  };
-  gpio_config(&io_in);
 
   ledc_timer_config_t ledc_timer = { 
     .speed_mode = LEDC_LOW_SPEED_MODE, 
@@ -918,7 +828,7 @@ void app_main(void) {
     .stop_bits = UART_STOP_BITS_1, 
     .flow_ctrl = UART_HW_FLOWCTRL_DISABLE 
   };
-  uart_param_config(UART_NUM_2, &uart_cfg); 
+    uart_param_config(UART_NUM_2, &uart_cfg); 
   uart_set_pin(UART_NUM_2, PIN_TX_TELEMETRY, PIN_RX_TELEMETRY, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
   uart_driver_install(UART_NUM_2, 1024, 1024, 0, NULL, 0);
 
@@ -936,8 +846,7 @@ void app_main(void) {
     .bitwidth = ADC_BITWIDTH_12, 
   };
   
-  esp_err_t cali_err = adc_cali_create_scheme_curve_fitting(&cali_config, &adc1_cali_handle);
-  if (cali_err != ESP_OK) {
+  if (adc_cali_create_scheme_curve_fitting(&cali_config, &adc1_cali_handle) != ESP_OK) {
       adc1_cali_handle = NULL;
   }
 
@@ -968,10 +877,6 @@ void app_main(void) {
   xTaskCreateStaticPinnedToCore(
       codeTaskMemoryScrubber, "TaskScrub", STACK_SIZE_SCRUB, NULL, 5, 
       scrubTaskStack, &scrubTaskBuffer, 0);
-
-  xTaskCreateStaticPinnedToCore(
-      codeTaskModeButton, "TaskBtnMode", STACK_SIZE_BTN, NULL, 1, 
-      btnTaskStack, &btnTaskBuffer, 0);
 
   xTaskCreateStaticPinnedToCore(
       codeTaskTelemetry, "TaskTel", STACK_SIZE_TEL, NULL, 3, 
